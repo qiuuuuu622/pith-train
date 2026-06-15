@@ -55,7 +55,10 @@ def _fp8_gemm_nt(
     allocate-then-``fp8_fp4_gemm_nt`` convention shared by the FP8 linear layer and the MLA
     pass-latent ring decompress."""
     out = torch.empty((m, n), device=device, dtype=dtype)
-    deep_gemm.fp8_fp4_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out)
+    if ARCH_MAJOR >= 10:
+        deep_gemm.fp8_fp4_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out)
+    else:
+        deep_gemm.fp8_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out)
     return out
 
 
