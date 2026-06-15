@@ -41,6 +41,17 @@ def _m_grouped_fp8_gemm_nt(a, b, d, grouped_mm_offs, M, group_indices=None):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(a, b, d, group_indices)
 
 
+def _dequantize_blockwise_fp8(fp8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize a blockwise-scaled FP8 tensor to BF16.
+
+    scale has shape (ceil(rows/128), ceil(cols/128)); each 128×128 tile of fp8 is divided by its
+    corresponding scale entry during quantization, so dequant multiplies fp8 * scale.
+    """
+    rows, cols = fp8.shape
+    scale_exp = scale.repeat_interleave(128, dim=0)[:rows].repeat_interleave(128, dim=1)[:cols]
+    return fp8.to(torch.bfloat16) * scale_exp
+
+
 def _fp8_gemm_nt(
     a_fp8: torch.Tensor,
     a_scale: torch.Tensor,
@@ -51,14 +62,18 @@ def _fp8_gemm_nt(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """``out[m, n] = a @ b.T`` via the DeepGEMM fp8 NT GEMM. The single place that owns the
-    allocate-then-``fp8_fp4_gemm_nt`` convention shared by the FP8 linear layer and the MLA
-    pass-latent ring decompress."""
+    """``out[m, n] = a @ b.T`` via FP8 NT GEMM.
+
+    Blackwell (SM100+): deep_gemm fp8×fp4 GEMM.
+    Hopper (SM90): dequantize to BF16 then torch.mm (deep_gemm 0.1.0 has no Hopper single GEMM).
+    """
     out = torch.empty((m, n), device=device, dtype=dtype)
     if ARCH_MAJOR >= 10:
         deep_gemm.fp8_fp4_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out)
     else:
-        deep_gemm.fp8_gemm_nt((a_fp8, a_scale), (b_fp8, b_scale), out)
+        a_bf16 = _dequantize_blockwise_fp8(a_fp8, a_scale)
+        b_bf16 = _dequantize_blockwise_fp8(b_fp8, b_scale)
+        out = torch.mm(a_bf16, b_bf16.T).to(dtype)
     return out
 
 
