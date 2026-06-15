@@ -9,8 +9,8 @@ cfg = PretrainLMCfg()
 
 distributed = cfg.distributed
 distributed.context_parallel_size = 1  # Gated DeltaNet layers have no CP path
-distributed.pipeline_parallel_size = 2
-distributed.expert_parallel_size = 4
+distributed.pipeline_parallel_size = 1
+distributed.expert_parallel_size = 8
 
 training = cfg.training
 training.model = Path("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
@@ -26,7 +26,7 @@ training.sequence_length = 2048
 training.dataset = Path("/root/pith-train/dataset/dclm-baseline/toktxt/qwen3.5")
 training.moe_load_balance_type = "global-batch"
 training.moe_load_balance_coef = 1e-3
-training.fp8_training = "disabled"
+training.fp8_training = "deep-gemm"
 training.save_interval = 256
 training.save_location = Path("/root/pith-train/workspace/checkpoints/qwen3.5-35b-a3b")
 
