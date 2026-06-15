@@ -2,20 +2,21 @@
 
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
+from modelscope.hub.snapshot_download import snapshot_download
 
 from pithtrain.tasks.tokenize_corpus import TokenizeCorpusCfg, launch
 
-if __name__ == "__main__":
-    kwargs = dict()
-    kwargs["repo_type"] = "dataset"
-    kwargs["local_dir"] = "workspace/datasets/dclm-baseline/rawtxt"
-    kwargs["allow_patterns"] = "global-shard_03_of_10/local-shard_1_of_10/*.jsonl.zst"
-    snapshot_download("mlfoundations/dclm-baseline-1.0", **kwargs)
+if False:  # dataset already downloaded via hfd.sh
+    snapshot_download(
+        model_id="AI-ModelScope/dclm-baseline-1.0",
+        repo_type="dataset",
+        local_dir="/root/pith-train/dataset/dclm-baseline/rawtxt",
+        allow_patterns="global-shard_03_of_10/local-shard_1_of_10/*.jsonl.zst",
+    )
 
 if __name__ == "__main__":
     cfg = TokenizeCorpusCfg()
     cfg.tokenizer_name = "Qwen/Qwen3.5-35B-A3B"
-    cfg.source_path = Path("workspace/datasets/dclm-baseline/rawtxt")
-    cfg.output_path = Path("workspace/datasets/dclm-baseline/toktxt/qwen3.5")
+    cfg.source_path = Path("/root/pith-train/dataset/dclm-baseline/rawtxt/global-shard_03_of_10/local-shard_1_of_10")
+    cfg.output_path = Path("/root/pith-train/dataset/dclm-baseline/toktxt/qwen3.5")
     launch(cfg)
