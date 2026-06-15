@@ -526,7 +526,7 @@ class Qwen3_5MoeExperts(nn.Module):
             x, self.gate_up_proj, "gate_up_proj", grouped_mm_offs, ks, ks_tensor, gi
         )
         gate, up = gate_up.chunk(2, dim=-1)
-        activated = silu_mul(gate, up)
+        activated = silu_mul(gate.contiguous(), up.contiguous())
 
         return self._group_linear(
             activated, self.down_proj, "down_proj", grouped_mm_offs, ks, ks_tensor, gi
