@@ -26,6 +26,10 @@ from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBa
 from pithtrain.operators.deepgemm_fp8_quantize import fused_blockwise_transpose_cast_to_fp8_batched
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
+from pithtrain.operators.gated_delta_rule_cp import (
+    causal_conv_with_halo,
+    chunk_gated_delta_rule_cp,
+)
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -180,8 +184,16 @@ def torch_chunk_gated_delta_rule(
     beta: torch.Tensor,
     chunk_size: int = 64,
     use_qk_l2norm_in_kernel: bool = False,
-) -> torch.Tensor:
-    """Chunk-wise gated delta rule, mirroring HF's torch fallback (no cache)."""
+    initial_state: Optional[torch.Tensor] = None,
+    output_final_state: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Chunk-wise gated delta rule, mirroring HF's torch fallback (no cache).
+
+    Returns ``(core_attn_out, final_state)``. ``final_state`` is the recurrent state
+    after the last chunk (float32, shape ``[B, H, Dk, Dv]``) when
+    ``output_final_state`` is set, else ``None``. ``initial_state`` seeds the scan;
+    both are the cross-rank carry used by the context-parallel path.
+    """
     initial_dtype = query.dtype
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, dim=-1, eps=1e-6)
@@ -223,9 +235,12 @@ def torch_chunk_gated_delta_rule(
     attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-    last_recurrent_state = torch.zeros(
-        batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device
-    )
+    if initial_state is None:
+        last_recurrent_state = torch.zeros(
+            batch_size, num_heads, k_head_dim, v_head_dim, dtype=value.dtype, device=value.device
+        )
+    else:
+        last_recurrent_state = initial_state.to(value.dtype)
     core_attn_out = torch.zeros_like(value)
     mask = torch.triu(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
@@ -247,7 +262,9 @@ def torch_chunk_gated_delta_rule(
         core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
     )
     core_attn_out = core_attn_out[:, :, :sequence_length]
-    return core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    final_state = last_recurrent_state if output_final_state else None
+    return core_attn_out, final_state
 
 
 class Qwen3_5MoeGatedDeltaNet(nn.Module):
@@ -262,6 +279,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         linear_value_head_dim: int,
         linear_conv_kernel_dim: int,
         rms_norm_eps: float = 1e-6,
+        cp_group: Optional["dist.ProcessGroup"] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -273,6 +291,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.conv_kernel_size = linear_conv_kernel_dim
         self.use_fla = chunk_gated_delta_rule is not None
+        # Context-parallel process group (None / size-1 -> single-rank path).
+        self.cp_group = cp_group
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
@@ -313,8 +333,10 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        # Depthwise causal conv over the sequence dim, SiLU-activated.
-        mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+        # Depthwise causal conv over the sequence dim, SiLU-activated. Under context
+        # parallelism the conv borrows its left context (K-1 tokens) from the
+        # previous CP rank via a halo exchange; cp_group None/size-1 is a no-op.
+        mixed_qkv = F.silu(causal_conv_with_halo(self.conv1d, mixed_qkv, self.cp_group))
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
         query, key, value = torch.split(
@@ -331,21 +353,22 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        if self.use_fla:
-            core_attn_out, _ = chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-        else:
-            core_attn_out = torch_chunk_gated_delta_rule(
-                query, key, value, g=g, beta=beta, use_qk_l2norm_in_kernel=True
-            )
+        # Cross-rank recurrent-state scan (no-op when cp_group is None / size 1).
+        # The FLA kernel and the torch fallback share the same
+        # (initial_state, output_final_state) -> (out, final_state) contract.
+        kernel = chunk_gated_delta_rule if self.use_fla else torch_chunk_gated_delta_rule
+        state_shape = (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim)
+        core_attn_out = chunk_gated_delta_rule_cp(
+            kernel,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            self.cp_group,
+            state_shape=state_shape,
+            use_qk_l2norm_in_kernel=True,
+        )
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -681,6 +704,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         layer_idx: int,
         ep_size: int = 1,
         ep_group: Optional[dist.ProcessGroup] = None,
+        cp_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
         self.idx = layer_idx
@@ -696,6 +720,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 linear_value_head_dim=linear_value_head_dim,
                 linear_conv_kernel_dim=linear_conv_kernel_dim,
                 rms_norm_eps=rms_norm_eps,
+                cp_group=cp_group,
             )
         elif layer_type == "full_attention":
             self.self_attn = Qwen3_5MoeAttention(
@@ -863,10 +888,15 @@ class Qwen3_5MoeModel(nn.Module):
         ep_group: Optional[dist.ProcessGroup] = None,
     ):
         super().__init__()
-        if cp_group is not None and cp_group.size() > 1:
+        self.cp_group = cp_group
+        cp_size = cp_group.size() if cp_group is not None else 1
+        if cp_size > 1 and "full_attention" in config.layer_types:
+            # Gated DeltaNet layers are CP-ready (contiguous-shard state scan + conv
+            # halo); the full-attention layers still need their ring path.
             raise NotImplementedError(
-                "Qwen3_5MoeModel does not support context parallelism: the Gated "
-                "DeltaNet layers have no sequence-parallel (ring) path."
+                "Context parallelism for Qwen3.5 is only wired for the Gated DeltaNet "
+                "(linear_attention) layers so far; full_attention layers need the ring "
+                "attention path before cp_size > 1 can be used end to end."
             )
 
         self.config = config
@@ -913,6 +943,7 @@ class Qwen3_5MoeModel(nn.Module):
                     layer_idx=i,
                     ep_size=ep_size,
                     ep_group=ep_group,
+                    cp_group=cp_group,
                 )
                 for i in range(layer_id_begin, layer_id_end)
             }
