@@ -13,7 +13,7 @@ import torch
 import torch.distributed.fsdp
 import torch.nn as nn
 from torch.distributed import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
 from torch.optim import Adam, Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, SequentialLR
 from transformers import AutoConfig
@@ -254,10 +254,14 @@ def apply_fsdp(
         raise ValueError(f"Unknown sharding_strategy: {sharding_strategy!r}")
     mp = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
+        reduce_dtype=torch.bfloat16,
         output_dtype=None,
         cast_forward_inputs=True,
     )
+    # Experts are unsharded (moe_fsdp_mesh has size 1), so their BF16 weights and
+    # FP32 Adam states (m+v+master ~46GB/GPU) sit idle on-device during fwd/bwd.
+    # Offload them to CPU to free the bulk of the peak; brought back on demand.
+    expert_offload = CPUOffloadPolicy(pin_memory=True)
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
         assert isinstance(
@@ -291,6 +295,7 @@ def apply_fsdp(
                     mesh=moe_fsdp_mesh,
                     reshard_after_forward=False,
                     mp_policy=mp,
+                    offload_policy=expert_offload,
                 )
             fully_shard(layer, mesh=other_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_attn")

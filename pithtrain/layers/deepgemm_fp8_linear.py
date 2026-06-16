@@ -52,7 +52,7 @@ def _fp8_gemm_nt(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """``out[m, n] = a @ b.T`` via the DeepGEMM fp8 NT GEMM. The single place that owns the
-    allocate-then-GEMM convention shared by the FP8 linear layer and the MLA
+    allocate-then-``fp8_fp4_gemm_nt`` convention shared by the FP8 linear layer and the MLA
     pass-latent ring decompress."""
     out = torch.empty((m, n), device=device, dtype=dtype)
     if ARCH_MAJOR >= 10:

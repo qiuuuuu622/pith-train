@@ -11,6 +11,7 @@
 set -euo pipefail
 export OMP_NUM_THREADS=8
 export PYTHONUNBUFFERED=1
+export PATH=/usr/local/cuda/bin:$PATH
 
 if [ $# -ne 1 ]; then
     echo "Usage: launch.sh <model>" >&2

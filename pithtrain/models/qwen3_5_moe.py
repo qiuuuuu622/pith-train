@@ -295,8 +295,11 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False
         )
         self.in_proj_z = LinearCls(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = LinearCls(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = LinearCls(self.hidden_size, self.num_v_heads, bias=False)
+        # b/a project to num_v_heads (e.g. 32), an N too small for the DeepGEMM FP8
+        # GEMM's TMA tiling (degenerate descriptor -> CUDA_ERROR_INVALID_VALUE). They
+        # are tiny, so keep them in BF16 -- no FP8 throughput is lost.
+        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.out_proj = LinearCls(self.value_dim, self.hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -606,8 +609,9 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.gate = Qwen3_5MoeTopKRouter(hidden_size, num_experts, num_experts_per_tok)
         self.experts = Qwen3_5MoeExperts(self.experts_per_rank, hidden_size, moe_intermediate_size)
         self.shared_expert = Qwen3_5MoeMLP(hidden_size, shared_expert_intermediate_size)
-        LinearCls = get_linear_cls()
-        self.shared_expert_gate = LinearCls(hidden_size, 1, bias=False)
+        # N=1 scalar gate: too small for the DeepGEMM FP8 GEMM's TMA tiling
+        # (degenerate descriptor -> CUDA_ERROR_INVALID_VALUE). Keep it BF16.
+        self.shared_expert_gate = nn.Linear(hidden_size, 1, bias=False)
 
     def shared_expert_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.shared_expert_gate(hidden_states)) * self.shared_expert(
