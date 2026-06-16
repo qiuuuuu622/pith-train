@@ -435,6 +435,12 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         max_steps = cfg.training.max_steps
         loss, lr = torch.mean(loss).item(), scheduler.get_last_lr()[0]
         tokens_per_second = global_batch_size * cfg.training.sequence_length / elapsed
+        import os as _os
+        _world = torch.distributed.get_world_size()
+        tokens_per_second_per_gpu = tokens_per_second / _world
+        _fpt = float(_os.environ.get("BENCH_FLOPS_PER_TOKEN", "0"))
+        _peak = float(_os.environ.get("BENCH_PEAK_TFLOPS", "989")) * 1e12
+        mfu = (_fpt * tokens_per_second / _world / _peak) if _fpt > 0 else 0.0
         statements = []
         statements.append("step %08d/%08d" % (step + 1, max_steps))
         statements.append("step-time %.3f sec" % elapsed)
@@ -444,6 +450,9 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         statements.append("learning-rate %.6e" % lr)
         statements.append("gradient-norm %.4f" % gradient_norm.item())
         statements.append("tokens-per-second %s" % format(tokens_per_second, ",.0f"))
+        statements.append("tok/s/gpu %s" % format(tokens_per_second_per_gpu, ",.0f"))
+        if mfu > 0:
+            statements.append("mfu %.1f%%" % (mfu * 100))
         statements.append("peak-gpu-memory %.2f GB" % peak_gpu_mem)
         logger.info(" | ".join(statements))
         # Lazily initialize WandB on the first successful step.
@@ -457,6 +466,8 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
             metrics["train/learning-rate"] = lr
             metrics["train/gradient-norm"] = gradient_norm
             metrics["infra/tokens-per-second"] = tokens_per_second
+            metrics["infra/tokens-per-second-per-gpu"] = tokens_per_second_per_gpu
+            metrics["infra/mfu"] = mfu
             metrics["infra/peak-gpu-memory"] = peak_gpu_mem
             metrics["infra/step-time"] = elapsed
             wandb.log(metrics)

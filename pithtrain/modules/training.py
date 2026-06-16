@@ -126,6 +126,14 @@ class TrainingCfg(SlottedDefault):
     block scaling via DeepGEMM). Supports SM90 (Hopper) and SM100+ (Blackwell).
     """
 
+    expert_cpu_offload: bool = True
+    """
+    Offload MoE expert weights and optimizer state to host RAM via FSDP
+    CPUOffloadPolicy. Keeps large models within HBM but adds a CPU<->GPU copy on
+    the critical path each step. Set ``False`` when the model fits on device for a
+    substantial throughput gain (measured ~2.4x on a small MoE proxy on 4xH100).
+    """
+
     init_std: float = 0.02
     """
     Standard deviation for weight initialization.
@@ -235,6 +243,7 @@ def apply_fsdp(
     model,
     mesh: DeviceMesh,
     sharding_strategy: Literal["fsdp", "hsdp"] = "fsdp",
+    expert_cpu_offload: bool = True,
 ):
     # MoE params: unique per EP rank, replicated across DP x CP.
     # Non-MoE params: replicated across DP x CP x EP.
@@ -261,7 +270,10 @@ def apply_fsdp(
     # Experts are unsharded (moe_fsdp_mesh has size 1), so their BF16 weights and
     # FP32 Adam states (m+v+master ~46GB/GPU) sit idle on-device during fwd/bwd.
     # Offload them to CPU to free the bulk of the peak; brought back on demand.
-    expert_offload = CPUOffloadPolicy(pin_memory=True)
+    # Expert CPU offload frees idle expert weights/optimizer state to host RAM
+    # (needed to fit large models), but adds a CPU<->GPU copy on the critical path
+    # every step; disable it when the model fits on device for a large throughput win.
+    expert_offload = CPUOffloadPolicy(pin_memory=True) if expert_cpu_offload else None
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
         assert isinstance(
@@ -385,7 +397,12 @@ def setup_model(
         init_weights(module, num_layers, cfg.init_std)
 
     modules = nn.Sequential(*modules)
-    apply_fsdp(modules, device_mesh, distributed_cfg.sharding_strategy)
+    apply_fsdp(
+        modules,
+        device_mesh,
+        distributed_cfg.sharding_strategy,
+        expert_cpu_offload=cfg.expert_cpu_offload,
+    )
 
     local_seq_len = cfg.sequence_length // cp_size
     # sequence_length = cfg.sequence_length, TODO this is kept here for stripe context parallelism
