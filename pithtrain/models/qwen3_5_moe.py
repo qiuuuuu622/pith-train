@@ -26,14 +26,8 @@ from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBa
 from pithtrain.operators.deepgemm_fp8_quantize import fused_blockwise_transpose_cast_to_fp8_batched
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
-from pithtrain.operators.gated_delta_rule_cp import (
-    causal_conv_with_halo,
-    chunk_gated_delta_rule_cp,
-    conv_on_halo,
-    fetch_left_halo,
-    recv_delta_state,
-    send_delta_state,
-)
+from pithtrain.operators.gated_delta_rule_cp import head_parallel_gated_delta_net
+from pithtrain.operators.ring_attention import ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
@@ -297,8 +291,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.use_fla = chunk_gated_delta_rule is not None
         # Context-parallel process group (None / size-1 -> single-rank path).
         self.cp_group = cp_group
-        # Selective activation recompute: split CP comms outside checkpoint boundary.
-        self.use_selective_recompute = False
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
@@ -329,138 +321,34 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.out_proj = LinearCls(self.value_dim, self.hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.use_selective_recompute:
-            return self._forward_recompute(hidden_states)
-        return self._forward_standard(hidden_states)
-
-    def _forward_standard(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.shape
-
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-
+        # Projections are sequence-sharded (zigzag) under CP; the head-parallel
+        # helper handles the all-to-all / reorder so the conv + chunk scan run on
+        # the full natural-order sequence for this rank's head slice.
+        mixed_qkv = self.in_proj_qkv(hidden_states)
         z = self.in_proj_z(hidden_states)
-        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
         b = self.in_proj_b(hidden_states)
         a = self.in_proj_a(hidden_states)
 
-        # Depthwise causal conv over the sequence dim, SiLU-activated. Under context
-        # parallelism the conv borrows its left context (K-1 tokens) from the
-        # previous CP rank via a halo exchange; cp_group None/size-1 is a no-op.
-        mixed_qkv = F.silu(causal_conv_with_halo(self.conv1d, mixed_qkv, self.cp_group))
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-
-        query, key, value = torch.split(
-            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
-        )
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-        beta = b.sigmoid()
-        # Computed in float32: in bf16/fp16, A_log.exp() can overflow to inf.
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        # Cross-rank recurrent-state scan (no-op when cp_group is None / size 1).
-        # The FLA kernel and the torch fallback share the same
-        # (initial_state, output_final_state) -> (out, final_state) contract.
         kernel = chunk_gated_delta_rule if self.use_fla else torch_chunk_gated_delta_rule
-        state_shape = (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim)
-        core_attn_out = chunk_gated_delta_rule_cp(
-            kernel,
-            query,
-            key,
-            value,
-            g,
-            beta,
-            self.cp_group,
-            state_shape=state_shape,
+        core_attn_out = head_parallel_gated_delta_net(
+            mixed_qkv,
+            z,
+            b,
+            a,
+            conv_weight=self.conv1d.weight,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            norm=self.norm,
+            kernel=kernel,
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
+            num_k_heads=self.num_k_heads,
+            num_v_heads=self.num_v_heads,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            cp_group=self.cp_group,
             use_qk_l2norm_in_kernel=True,
         )
-
-        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
-
-        return self.out_proj(core_attn_out)
-
-    def _forward_recompute(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Selective recompute forward: CP communications happen outside the checkpoint.
-
-        Splits each CP-aware op into:
-          1. Communication step (outside checkpoint): fetch halo, recv initial_state.
-          2. Compute step (inside checkpoint): conv + delta-rule kernel.
-          3. Communication step (outside checkpoint): send final_state.
-
-        During backward recompute the compute step re-runs with the pre-fetched tensors
-        as saved inputs, so no extra cross-rank communication is triggered.
-        """
-        import torch.utils.checkpoint as ckpt
-
-        batch_size, seq_len, _ = hidden_states.shape
-        kernel = chunk_gated_delta_rule if self.use_fla else torch_chunk_gated_delta_rule
-        state_shape = (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim)
-
-        # ---- Projection (local, outside checkpoint) ----
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
-
-        # ---- Communication step 1: fetch conv halo ----
-        k_minus_1 = self.conv1d.kernel_size[0] - 1
-        haloed_qkv = fetch_left_halo(mixed_qkv, k_minus_1, self.cp_group)
-
-        # ---- Communication step 2: receive initial recurrent state ----
-        initial_state = recv_delta_state(state_shape, torch.float32, hidden_states.device, self.cp_group)
-
-        # ---- Compute step (inside checkpoint) ----
-        # All inputs are pre-fetched tensors; no communication inside.
-        def _compute(haloed_qkv, z, b, a, *state_args):
-            # state_args is () or (initial_state,) to handle optional tensor.
-            _initial_state = state_args[0] if state_args else None
-
-            mixed_qkv_out = F.silu(conv_on_halo(self.conv1d, haloed_qkv, seq_len))
-            mixed_qkv_out = mixed_qkv_out.transpose(1, 2)
-
-            query, key, value = torch.split(
-                mixed_qkv_out, [self.key_dim, self.key_dim, self.value_dim], dim=-1
-            )
-            query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-            key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-            value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-            beta = b.sigmoid()
-            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-            if self.num_v_heads // self.num_k_heads > 1:
-                query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-                key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-            core_out, final_st = kernel(
-                query, key, value, g=g, beta=beta,
-                initial_state=_initial_state, output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
-
-            z_r = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
-            core_out = core_out.reshape(-1, self.head_v_dim)
-            z_r = z_r.reshape(-1, self.head_v_dim)
-            core_out = self.norm(core_out, z_r)
-            core_out = core_out.reshape(batch_size, seq_len, -1)
-            return core_out, final_st
-
-        ckpt_args = (haloed_qkv, z, b, a) + ((initial_state,) if initial_state is not None else ())
-        core_attn_out, final_state = ckpt.checkpoint(_compute, *ckpt_args, use_reentrant=False)
-
-        # ---- Communication step 3: send final state ----
-        coupling = send_delta_state(final_state, torch.float32, self.cp_group)
-        if coupling is not None:
-            core_attn_out = core_attn_out + coupling
-
         return self.out_proj(core_attn_out)
 
 
@@ -481,8 +369,11 @@ class Qwen3_5MoeAttention(nn.Module):
         rms_norm_eps: float = 1e-6,
         attention_bias: bool = False,
         attn_output_gate: bool = True,
+        cp_group: Optional["dist.ProcessGroup"] = None,
     ):
         super().__init__()
+        self.cp_group = cp_group
+        self.use_ring_attn = cp_group is not None and cp_group.size() > 1
         self.hidden_size = hidden_size
         self.num_heads = num_attention_heads
         self.num_kv_heads = num_key_value_heads
@@ -530,13 +421,23 @@ class Qwen3_5MoeAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        attn_output = flash_attn_func(
-            query_states,
-            key_states,
-            value_states,
-            softmax_scale=self.scaling,
-            causal=True,
-        )
+        if self.use_ring_attn:
+            # Zigzag ring attention across CP ranks (load-balanced causal).
+            attn_output = ring_attention_func(
+                query_states,
+                key_states,
+                value_states,
+                sm_scale=self.scaling,
+                cp_group=self.cp_group,
+            )
+        else:
+            attn_output = flash_attn_func(
+                query_states,
+                key_states,
+                value_states,
+                softmax_scale=self.scaling,
+                causal=True,
+            )
 
         attn_output = attn_output.reshape(bsz, seq_len, self.num_heads * self.head_dim)
         if gate is not None:
@@ -817,6 +718,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 rms_norm_eps=rms_norm_eps,
                 attention_bias=attention_bias,
                 attn_output_gate=attn_output_gate,
+                cp_group=cp_group,
             )
         else:
             raise ValueError(f"Unknown layer_type: {layer_type}")
@@ -836,7 +738,15 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
 
         # The FLA chunked delta-rule kernel self-compiles; nested compile is
         # not supported, so unwrap the compiled region only when it is active.
-        if layer_type == "linear_attention" and self.linear_attn.use_fla:
+        cp_active = cp_group is not None and cp_group.size() > 1
+        unwrap_compile = layer_type == "linear_attention" and (
+            self.linear_attn.use_fla or cp_active
+        )
+        if layer_type == "full_attention" and cp_active:
+            # Ring attention uses async P2P + a custom autograd Function that
+            # torch.compile(fullgraph=True) cannot trace; run it eagerly.
+            unwrap_compile = True
+        if unwrap_compile:
             self._forward_attn_compute = self._forward_attn_compute.__wrapped__.__get__(
                 self, type(self)
             )
@@ -975,15 +885,8 @@ class Qwen3_5MoeModel(nn.Module):
     ):
         super().__init__()
         self.cp_group = cp_group
-        cp_size = cp_group.size() if cp_group is not None else 1
-        if cp_size > 1 and "full_attention" in config.layer_types:
-            # Gated DeltaNet layers are CP-ready (contiguous-shard state scan + conv
-            # halo); the full-attention layers still need their ring path.
-            raise NotImplementedError(
-                "Context parallelism for Qwen3.5 is only wired for the Gated DeltaNet "
-                "(linear_attention) layers so far; full_attention layers need the ring "
-                "attention path before cp_size > 1 can be used end to end."
-            )
+        self.cp_rank = cp_group.rank() if cp_group is not None else 0
+        self.cp_size = cp_group.size() if cp_group is not None else 1
 
         self.config = config
         self.stage_id = stage_id
@@ -1059,8 +962,25 @@ class Qwen3_5MoeModel(nn.Module):
 
         bsz, seq_len, _ = hidden_states.shape
 
-        cos, sin = self.rotary_emb(hidden_states, seq_len=seq_len)
-        position_embeddings = (cos.unsqueeze(0), sin.unsqueeze(0))
+        if self.cp_size == 1:
+            cos, sin = self.rotary_emb(hidden_states, seq_len=seq_len)
+            position_embeddings = (cos.unsqueeze(0), sin.unsqueeze(0))
+        else:
+            # Zigzag CP: the local seq_len tokens come from two non-contiguous
+            # global chunks. Build global position ids (front + mirror back) and
+            # gather cos/sin so RoPE uses true global positions.
+            block = seq_len // 2
+            global_seq_len = seq_len * self.cp_size
+            front_start = self.cp_rank * block
+            back_start = (2 * self.cp_size - self.cp_rank - 1) * block
+            position_ids = torch.cat(
+                [
+                    torch.arange(front_start, front_start + block, device=hidden_states.device),
+                    torch.arange(back_start, back_start + block, device=hidden_states.device),
+                ]
+            )
+            cos, sin = self.rotary_emb(hidden_states, seq_len=global_seq_len)
+            position_embeddings = (cos[position_ids].unsqueeze(0), sin[position_ids].unsqueeze(0))
 
         for _, layer in self.layers.items():
             layer._position_embeddings = position_embeddings

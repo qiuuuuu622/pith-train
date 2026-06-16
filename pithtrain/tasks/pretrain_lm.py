@@ -126,54 +126,6 @@ def get_global_batch(
     return local_tokens, local_labels
 
 
-def split_sequence_for_cp(
-    tokens: torch.Tensor,
-    labels: torch.Tensor,
-    cp_group: "torch.distributed.ProcessGroup",
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split [B, S] token/label tensors into contiguous CP shards along S.
-
-    Rank r receives tokens[:, r*S/cp : (r+1)*S/cp]. This is the data-path
-    counterpart to the contiguous-shard layout used by the Gated DeltaNet CP
-    and full-attention ring (Increment 3). When cp_size == 1 the inputs are
-    returned unchanged so the existing single-rank path is byte-for-byte
-    identical.
-    """
-    import torch.distributed as dist
-
-    if cp_group is None or dist.get_world_size(cp_group) == 1:
-        return tokens, labels
-    cp_rank = dist.get_rank(cp_group)
-    cp_size = dist.get_world_size(cp_group)
-    S = tokens.shape[1]
-    shard = S // cp_size
-    start, end = cp_rank * shard, (cp_rank + 1) * shard
-    return tokens[:, start:end].contiguous(), labels[:, start:end].contiguous()
-
-
-def reduce_loss_across_cp(
-    loss: torch.Tensor,
-    n_local_tokens: int,
-    cp_group: "torch.distributed.ProcessGroup",
-) -> torch.Tensor:
-    """Reduce per-shard loss scalars into a global token-weighted mean.
-
-    Each CP rank holds a loss that is the *mean* over its local tokens.
-    Multiplying by the local token count gives the sum; all-reduce the sums
-    and divide by the total token count to recover the global mean. When
-    cp_size == 1 the loss is returned unchanged.
-    """
-    import torch.distributed as dist
-
-    if cp_group is None or dist.get_world_size(cp_group) == 1:
-        return loss
-    weighted = loss * n_local_tokens
-    torch.distributed.all_reduce(weighted, group=cp_group)
-    total = weighted.new_tensor(float(n_local_tokens))
-    torch.distributed.all_reduce(total, group=cp_group)
-    return weighted / total
-
-
 def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     output = output.view(-1, output.size(-1))
     target = target.view(-1)
@@ -207,7 +159,9 @@ def clip_grad_norm_(model: nn.Module, max_norm: float, norm_type: float = 2.0) -
     if clip_coef < 1.0:
         for p in model.parameters():
             if p.grad is not None:
-                p.grad.mul_(clip_coef)
+                # Expert params use FSDP CPUOffloadPolicy, so their grads live on
+                # CPU while clip_coef is on the GPU; match each grad's device.
+                p.grad.mul_(clip_coef.to(p.grad.device))
     return total_norm
 
 

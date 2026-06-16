@@ -1,312 +1,268 @@
 """Context-parallel (CP) path for the Gated DeltaNet token mixer.
 
-Qwen3.5's linear-attention layers are a *recurrent* (chunk-wise gated delta rule)
-scan, not softmax attention, so they cannot reuse the zigzag ring-attention kernel.
-Their sequence dependency is, however, simpler: only two things cross a CP rank
-boundary when the global sequence is split *contiguously* across ``cp_size`` ranks
-(rank ``r`` owns tokens ``[r*S/cp : (r+1)*S/cp]``):
+This follows the design used by Megatron-LM for Mamba/SSM-family layers
+(``megatron/core/ssm/mamba_context_parallel.py``): **all-to-all head
+parallelism**, *not* a contiguous-shard sequential state scan.
 
-1. the depthwise **causal conv1d** (kernel ``K``) needs the last ``K-1`` tokens of
-   the left neighbour -- a small *halo* exchange;
-2. the **recurrent state** of the delta rule (shape ``[B, H, Dk, Dv]``) must flow
-   left-to-right: rank ``r`` starts its scan from the final state produced by rank
-   ``r-1``.
+Under CP the global sequence is sharded across ``cp_size`` ranks in the
+*zigzag* (load-balanced) layout that the attention ring uses -- rank ``r`` owns
+chunk ``r`` and chunk ``2*cp_size-r-1`` of ``2*cp_size`` equal chunks.  The
+linear-attention layer cannot consume that layout directly: its causal conv and
+recurrent scan are order-sensitive.  So per layer we:
 
-This module implements both as differentiable ops. v1 threads the state
-*sequentially* (rank ``r`` waits on ``r-1``); the heavy per-segment matmuls are
-already done by the FLA / torch chunk kernel, and only the tiny state matrix is
-communicated. A parallel prefix scan (O(log cp)) is a later optimisation.
+1. ``all_to_all_cp2hp``: turn the *sequence-sharded, all-heads* activations into
+   *full-sequence, head-sharded* activations (each rank keeps ``1/cp`` of the
+   heads but the whole sequence);
+2. ``undo_zigzag``: restore natural token order on the now-full sequence;
+3. run the conv + chunk delta-rule scan locally on the full sequence for this
+   rank's head slice -- **no halo, no cross-rank state passing**;
+4. ``redo_zigzag`` + ``all_to_all_hp2cp``: go back to the sequence-sharded,
+   all-heads layout for the residual / out-projection.
 
-Backward mirrors forward with the direction reversed:
-* the conv halo sends the gradient of the borrowed columns back to the left;
-* the state scan flows ``dstate`` right-to-left.
+Versus the sequential state-scan alternative, this trades a little extra
+bandwidth (two all-to-alls of the activations) for *no* serialization across CP
+ranks: every rank runs an independent full-sequence scan, perfectly balanced.
 
-For ``cp_size == 1`` every helper is a no-op and reduces to the single-rank path.
+For ``cp_size == 1`` every helper is a no-op and the path reduces to the plain
+single-rank forward.
 """
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
-# P2P primitives must not be traced by the FLA self-compile / inductor.
-_send = torch.compiler.disable(dist.send)
-_recv = torch.compiler.disable(dist.recv)
-
-
-def _neighbor_global_ranks(cp_group: dist.ProcessGroup) -> tuple[int, int, int, int]:
-    """Return ``(cp_rank, cp_size, left_global, right_global)``.
-
-    ``left``/``right`` are ``-1`` at the contiguous-sequence boundaries (rank 0 has
-    no left neighbour, the last rank has no right neighbour) -- the scan does not
-    wrap around the way ring attention does.
-    """
-    cp_rank = dist.get_rank(cp_group)
-    cp_size = dist.get_world_size(cp_group)
-    left = dist.get_global_rank(cp_group, cp_rank - 1) if cp_rank > 0 else -1
-    right = dist.get_global_rank(cp_group, cp_rank + 1) if cp_rank < cp_size - 1 else -1
-    return cp_rank, cp_size, left, right
+# All-to-all must not be traced by the FLA self-compile / inductor.
+_all_to_all_single = torch.compiler.disable(dist.all_to_all_single)
 
 
 # ---------------------------------------------------------------------------
-# Causal conv1d halo exchange
+# Zigzag <-> natural sequence reordering (along dim=1)
 # ---------------------------------------------------------------------------
+# After ``all_to_all_cp2hp`` the full sequence is the concatenation of every
+# rank's zigzag-local shard, in rank order:
+#     [r0.front, r0.back, r1.front, r1.back, ...]
+#   = [chunk0,   chunk2c-1, chunk1,  chunk2c-2, ...]
+# where ``front`` of rank r is global chunk ``r`` and ``back`` is global chunk
+# ``2*cp-1-r``.  ``undo_zigzag`` permutes those ``2*cp`` chunks back to natural
+# order ``[chunk0, chunk1, ..., chunk2c-1]``; ``redo_zigzag`` is the inverse.
 
 
-class _LeftHalo(torch.autograd.Function):
-    """Prepend the left neighbour's last ``halo`` columns to ``x``.
-
-    ``x`` is the conv input laid out as ``[B, C, S_local]`` (channels = conv_dim).
-    Forward sends our last ``halo`` columns to the right neighbour (they become its
-    halo) and receives ``halo`` columns from the left neighbour (zeros at rank 0),
-    returning ``cat([recv, x], dim=-1)`` of width ``S_local + halo``.
-
-    Backward splits the incoming gradient: the first ``halo`` columns belong to the
-    left neighbour's tail and are shipped left; the remainder is the local gradient,
-    to which we add the gradient of the columns we lent to the right.
-    """
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, halo: int, cp_group: dist.ProcessGroup):
-        cp_rank, cp_size, left, right = _neighbor_global_ranks(cp_group)
-        ctx.halo = halo
-        ctx.cp_group = cp_group
-        ctx.left = left
-        ctx.right = right
-
-        send_cols = x[..., -halo:].contiguous()  # our tail -> right neighbour's halo
-        recv_cols = torch.zeros_like(send_cols)  # left halo; stays zero at rank 0
-
-        # Ordered to avoid deadlock: even ranks send-then-recv, odd recv-then-send.
-        if cp_rank % 2 == 0:
-            if right >= 0:
-                _send(send_cols, right)
-            if left >= 0:
-                _recv(recv_cols, left)
-        else:
-            if left >= 0:
-                _recv(recv_cols, left)
-            if right >= 0:
-                _send(send_cols, right)
-
-        return torch.cat([recv_cols, x], dim=-1)
-
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        halo = ctx.halo
-        left, right = ctx.left, ctx.right
-        cp_rank = dist.get_rank(ctx.cp_group)
-
-        grad_halo = grad_out[..., :halo].contiguous()  # -> left neighbour's tail
-        grad_local = grad_out[..., halo:].contiguous()  # our own columns
-        grad_tail = torch.zeros_like(grad_halo)  # grad for cols we lent right
-
-        if cp_rank % 2 == 0:
-            if left >= 0:
-                _send(grad_halo, left)
-            if right >= 0:
-                _recv(grad_tail, right)
-        else:
-            if right >= 0:
-                _recv(grad_tail, right)
-            if left >= 0:
-                _send(grad_halo, left)
-
-        # Add the gradient flowing back for the tail columns we sent right.
-        grad_local[..., -halo:] += grad_tail
-        return grad_local, None, None
-
-
-def causal_conv_with_halo(
-    conv1d: torch.nn.Conv1d,
-    x: torch.Tensor,
-    cp_group: Optional[dist.ProcessGroup],
-) -> torch.Tensor:
-    """Depthwise causal conv over the sequence with cross-rank left context.
-
-    ``x`` is ``[B, C, S_local]``. Returns ``[B, C, S_local]`` matching the
-    single-rank causal conv (left-padded by zeros at the global sequence start).
-    """
-    k_minus_1 = conv1d.kernel_size[0] - 1
-    if cp_group is None or dist.get_world_size(cp_group) == 1 or k_minus_1 == 0:
-        # Single rank: replicate the original (pad both sides, keep first S).
-        return conv1d(x)[..., : x.shape[-1]]
-    # Provide real left context, then run the conv with no extra left padding.
-    x_haloed = _LeftHalo.apply(x, k_minus_1, cp_group)
-    # conv1d keeps padding=k_minus_1; the haloed input already carries the left
-    # context, so trim the leading halo and the right padding to S_local.
-    out = conv1d(x_haloed)[..., k_minus_1 : k_minus_1 + x.shape[-1]]
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Recurrent-state scan across CP ranks
-# ---------------------------------------------------------------------------
-
-
-class _SendFinalState(torch.autograd.Function):
-    """Ship this segment's final recurrent state to the right neighbour.
-
-    Forward sends ``state`` (no local consumer) and returns a zero scalar that the
-    caller adds to the output so this node stays in the autograd graph. Backward
-    receives ``dstate`` from the right neighbour (zeros at the last rank) and returns
-    it as the gradient of ``state``, routing it into the chunk kernel's backward.
-    """
-
-    @staticmethod
-    def forward(ctx, state: torch.Tensor, cp_group: dist.ProcessGroup):
-        _, _, _, right = _neighbor_global_ranks(cp_group)
-        ctx.cp_group = cp_group
-        ctx.right = right
-        ctx.state_shape = state.shape
-        ctx.state_dtype = state.dtype
-        ctx.state_device = state.device
-        if right >= 0:
-            _send(state.contiguous(), right)
-        return state.new_zeros(())
-
-    @staticmethod
-    def backward(ctx, _grad_zero: torch.Tensor):
-        dstate = torch.zeros(
-            ctx.state_shape, dtype=ctx.state_dtype, device=ctx.state_device
-        )
-        if ctx.right >= 0:
-            _recv(dstate, ctx.right)
-        return dstate, None
-
-
-# ---------------------------------------------------------------------------
-# Comm/compute split helpers for selective activation recompute (Increment 2)
-# ---------------------------------------------------------------------------
-# The key correctness property: during torch.utils.checkpoint recompute, the
-# re-run must NOT re-trigger cross-rank communication.  Split each CP-aware op
-# into a communication step (runs once, outside checkpoint) and a compute step
-# (checkpointable, takes the pre-fetched tensors as inputs).
-# ---------------------------------------------------------------------------
-
-
-def fetch_left_halo(x: torch.Tensor, halo: int, cp_group: dist.ProcessGroup) -> torch.Tensor:
-    """Communication step: prepend left neighbour's last ``halo`` columns.
-
-    Returns the haloed input ``[B, C, halo + S_local]``.  Call this BEFORE the
-    checkpoint boundary; pass the result as a saved input to the checkpointed
-    compute function so no re-communication happens during recompute.
-    """
-    if cp_group is None or dist.get_world_size(cp_group) == 1 or halo == 0:
+def undo_zigzag(x: torch.Tensor, cp_size: int, dim: int = 1) -> torch.Tensor:
+    """Gathered-zigzag chunk order -> natural token order."""
+    if cp_size == 1:
         return x
-    return _LeftHalo.apply(x, halo, cp_group)
+    gathered = list(torch.chunk(x, 2 * cp_size, dim=dim))
+    natural = [None] * (2 * cp_size)
+    for g in range(2 * cp_size):
+        r = g // 2
+        c = r if g % 2 == 0 else (2 * cp_size - 1 - r)
+        natural[c] = gathered[g]
+    return torch.cat(natural, dim=dim)
 
 
-def conv_on_halo(conv1d: torch.nn.Conv1d, haloed_x: torch.Tensor, s_local: int) -> torch.Tensor:
-    """Compute step: apply causal conv on a pre-haloed input.  No communication.
+def redo_zigzag(x: torch.Tensor, cp_size: int, dim: int = 1) -> torch.Tensor:
+    """Natural token order -> gathered-zigzag chunk order (inverse of undo)."""
+    if cp_size == 1:
+        return x
+    natural = list(torch.chunk(x, 2 * cp_size, dim=dim))
+    gathered = []
+    for g in range(2 * cp_size):
+        r = g // 2
+        c = r if g % 2 == 0 else (2 * cp_size - 1 - r)
+        gathered.append(natural[c])
+    return torch.cat(gathered, dim=dim)
 
-    ``haloed_x`` is either:
-    - ``[B, C, halo + S_local]`` (from ``fetch_left_halo`` with real halo), or
-    - ``[B, C, S_local]`` (when cp_size==1: ``fetch_left_halo`` is a no-op).
 
-    Returns ``[B, C, S_local]``.  Safe to put inside ``torch.utils.checkpoint``.
+# ---------------------------------------------------------------------------
+# All-to-all: sequence-parallel <-> head-parallel
+# ---------------------------------------------------------------------------
+# Input layout is ``[B, S, C]`` (sequence dim 1, channel/head dim 2).  cp2hp
+# turns ``[B, S/cp, C]`` (this rank's seq shard, all channels) into
+# ``[B, S, C/cp]`` (full sequence, this rank's channel slice).  hp2cp is the
+# inverse.  ``C`` must be divisible by ``cp_size`` and laid out head-major so a
+# contiguous ``C/cp`` slice corresponds to a contiguous group of heads.
+
+
+def _raw_cp2hp(x: torch.Tensor, group: dist.ProcessGroup, cp: int) -> torch.Tensor:
+    B, Sl, C = x.shape
+    Cc = C // cp
+    # split channels into cp groups; group h is destined for rank h
+    x = x.view(B, Sl, cp, Cc).permute(2, 0, 1, 3).contiguous()  # [cp(group), B, Sl, Cc]
+    out = torch.empty_like(x)
+    _all_to_all_single(out, x, group=group)  # out[s] = source s's seq shard for our group
+    return out.permute(1, 0, 2, 3).reshape(B, cp * Sl, Cc)  # [B, S(source-major), Cc]
+
+
+def _raw_hp2cp(x: torch.Tensor, group: dist.ProcessGroup, cp: int) -> torch.Tensor:
+    B, S, Cc = x.shape
+    Sl = S // cp
+    x = x.view(B, cp, Sl, Cc).permute(1, 0, 2, 3).contiguous()  # [cp(source), B, Sl, Cc]
+    out = torch.empty_like(x)
+    _all_to_all_single(out, x, group=group)  # out[h] = channel group h gathered over seq
+    return out.permute(1, 2, 0, 3).reshape(B, Sl, cp * Cc)  # [B, Sl, C]
+
+
+class _AllToAllCP2HP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, group, cp):
+        ctx.group, ctx.cp = group, cp
+        return _raw_cp2hp(x, group, cp)
+
+    @staticmethod
+    def backward(ctx, g):
+        return _raw_hp2cp(g.contiguous(), ctx.group, ctx.cp), None, None
+
+
+class _AllToAllHP2CP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, group, cp):
+        ctx.group, ctx.cp = group, cp
+        return _raw_hp2cp(x, group, cp)
+
+    @staticmethod
+    def backward(ctx, g):
+        return _raw_cp2hp(g.contiguous(), ctx.group, ctx.cp), None, None
+
+
+def all_to_all_cp2hp(x: torch.Tensor, cp_group: dist.ProcessGroup) -> torch.Tensor:
+    """[B, S/cp, C] (seq-sharded) -> [B, S, C/cp] (head-sharded). Differentiable."""
+    cp = dist.get_world_size(cp_group)
+    if cp == 1:
+        return x
+    return _AllToAllCP2HP.apply(x.contiguous(), cp_group, cp)
+
+
+def all_to_all_hp2cp(x: torch.Tensor, cp_group: dist.ProcessGroup) -> torch.Tensor:
+    """[B, S, C/cp] (head-sharded) -> [B, S/cp, C] (seq-sharded). Differentiable."""
+    cp = dist.get_world_size(cp_group)
+    if cp == 1:
+        return x
+    return _AllToAllHP2CP.apply(x.contiguous(), cp_group, cp)
+
+
+# ---------------------------------------------------------------------------
+# Per-rank parameter slices (head-parallel)
+# ---------------------------------------------------------------------------
+
+
+def _conv_channel_index(
+    cp_rank: int, cp_size: int, key_dim: int, value_dim: int, device: torch.device
+) -> torch.Tensor:
+    """Channel indices of the depthwise conv weight owned by this CP rank.
+
+    The conv operates on ``mixed_qkv = [q (key_dim) | k (key_dim) | v (value_dim)]``.
+    cp2hp keeps channel group ``cp_rank`` of each component, i.e. a contiguous
+    ``dim/cp`` slice within each of the q/k/v blocks.
     """
-    k_minus_1 = conv1d.kernel_size[0] - 1
-    has_halo = haloed_x.shape[-1] > s_local
-    if k_minus_1 == 0 or not has_halo:
-        # Single-rank path: conv1d carries its own left padding; trim to S_local.
-        return conv1d(haloed_x)[..., :s_local]
-    # Multi-rank path: halo already provides left context; skip the built-in padding.
-    return conv1d(haloed_x)[..., k_minus_1 : k_minus_1 + s_local]
+    kc, vc = key_dim // cp_size, value_dim // cp_size
+    q = torch.arange(cp_rank * kc, (cp_rank + 1) * kc, device=device)
+    k = key_dim + q
+    v = 2 * key_dim + torch.arange(cp_rank * vc, (cp_rank + 1) * vc, device=device)
+    return torch.cat([q, k, v])
 
 
-def recv_delta_state(
-    state_shape: tuple,
-    state_dtype: torch.dtype,
-    device: torch.device,
-    cp_group: dist.ProcessGroup,
-) -> Optional[torch.Tensor]:
-    """Communication step: receive initial recurrent state from left neighbour.
-
-    Returns a tensor with a backward hook that ships its gradient back left.
-    Returns ``None`` for rank 0 (no left neighbour) and for cp_size == 1.
-    Call this BEFORE the checkpoint boundary.
-    """
-    if cp_group is None or dist.get_world_size(cp_group) == 1:
-        return None
-    cp_rank, _, left, _ = _neighbor_global_ranks(cp_group)
-    if cp_rank == 0:
-        return None
-    s_in = torch.empty(state_shape, dtype=state_dtype, device=device)
-    _recv(s_in, left)
-    s_in.requires_grad_(True)
-    s_in.register_hook(lambda grad: (_send(grad.contiguous(), left), grad)[1])
-    return s_in
+# ---------------------------------------------------------------------------
+# Head-parallel Gated DeltaNet forward
+# ---------------------------------------------------------------------------
 
 
-def send_delta_state(
-    final_state: torch.Tensor,
-    state_dtype: torch.dtype,
-    cp_group: dist.ProcessGroup,
-) -> Optional[torch.Tensor]:
-    """Communication step: send final state to right neighbour.
-
-    Returns the coupling scalar from ``_SendFinalState`` (add it to the output
-    to keep the send node in the autograd graph).  Returns ``None`` for the
-    last rank and for cp_size == 1.  Call this AFTER the checkpoint boundary.
-    """
-    if cp_group is None or dist.get_world_size(cp_group) == 1:
-        return None
-    return _SendFinalState.apply(final_state.to(state_dtype), cp_group)
-
-
-def chunk_gated_delta_rule_cp(
-    kernel: Callable,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    cp_group: Optional[dist.ProcessGroup],
+def head_parallel_gated_delta_net(
+    mixed_qkv: torch.Tensor,  # [B, S_local, conv_dim]  (post in_proj, pre-conv)
+    z: torch.Tensor,  # [B, S_local, value_dim]
+    b: torch.Tensor,  # [B, S_local, num_v_heads]
+    a: torch.Tensor,  # [B, S_local, num_v_heads]
     *,
-    state_shape: tuple[int, int, int, int],
-    state_dtype: torch.dtype = torch.float32,
+    conv_weight: torch.Tensor,  # [conv_dim, 1, K]  (depthwise, no bias)
+    A_log: torch.Tensor,  # [num_v_heads]
+    dt_bias: torch.Tensor,  # [num_v_heads]
+    norm: Callable,  # Qwen3_5MoeRMSNormGated
+    kernel: Callable,  # chunk gated delta-rule (FLA or torch fallback)
+    key_dim: int,
+    value_dim: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    cp_group: Optional[dist.ProcessGroup],
     use_qk_l2norm_in_kernel: bool = True,
 ) -> torch.Tensor:
-    """Run the chunk gated delta rule on a contiguous sequence shard.
+    """Run conv + chunk delta-rule under all-to-all head parallelism.
 
-    ``kernel`` is the chunk delta-rule callable (FLA or the torch fallback) and must
-    accept ``initial_state`` / ``output_final_state`` and return
-    ``(core_attn_out, final_state)``. ``state_shape`` is ``[B, H, Dk, Dv]`` and
-    ``state_dtype`` must match what the kernel produces for ``final_state`` (the
-    torch fallback computes in float32; pass that here for cross-rank consistency).
-
-    The incoming state is received from the left neighbour (zeros at rank 0). Its
-    gradient is shipped back left by a tensor hook. The outgoing final state is sent
-    right by ``_SendFinalState``, whose backward pulls ``dstate`` from the right.
+    Returns ``core_attn_out`` shaped ``[B, S_local, value_dim]`` (sequence-sharded,
+    zigzag layout) ready for the residual out-projection.  For ``cp_group`` None or
+    size 1 this is the plain single-rank forward.
     """
-    single = cp_group is None or dist.get_world_size(cp_group) == 1
-    if single:
-        out, _ = kernel(
-            query, key, value, g=g, beta=beta,
-            initial_state=None, output_final_state=False,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )
-        return out
+    cp_size = dist.get_world_size(cp_group) if cp_group is not None else 1
+    cp_rank = dist.get_rank(cp_group) if cp_group is not None else 0
+    batch_size = mixed_qkv.shape[0]
 
-    cp_rank, _, left, _ = _neighbor_global_ranks(cp_group)
+    if cp_size > 1:
+        # 1) seq-sharded -> head-sharded full sequence (split q/k/v separately so
+        #    head boundaries stay intact), then 2) restore natural token order.
+        q, k, v = torch.split(mixed_qkv, [key_dim, key_dim, value_dim], dim=-1)
+        q = undo_zigzag(all_to_all_cp2hp(q, cp_group), cp_size)
+        k = undo_zigzag(all_to_all_cp2hp(k, cp_group), cp_size)
+        v = undo_zigzag(all_to_all_cp2hp(v, cp_group), cp_size)
+        mixed_qkv = torch.cat([q, k, v], dim=-1)
+        z = undo_zigzag(all_to_all_cp2hp(z, cp_group), cp_size)
+        b = undo_zigzag(all_to_all_cp2hp(b, cp_group), cp_size)
+        a = undo_zigzag(all_to_all_cp2hp(a, cp_group), cp_size)
 
-    if cp_rank == 0:
-        initial_state = None
+        idx = _conv_channel_index(cp_rank, cp_size, key_dim, value_dim, mixed_qkv.device)
+        conv_weight = conv_weight.index_select(0, idx)
+        A_log = A_log[cp_rank * (num_v_heads // cp_size) : (cp_rank + 1) * (num_v_heads // cp_size)]
+        dt_bias = dt_bias[
+            cp_rank * (num_v_heads // cp_size) : (cp_rank + 1) * (num_v_heads // cp_size)
+        ]
+        nk = num_k_heads // cp_size
+        nv = num_v_heads // cp_size
+        kdim = key_dim // cp_size
+        vdim = value_dim // cp_size
     else:
-        s_in = torch.empty(state_shape, dtype=state_dtype, device=query.device)
-        _recv(s_in, left)
-        s_in.requires_grad_(True)
-        # Backward: ship the gradient of the borrowed initial state back left.
-        s_in.register_hook(lambda grad: (_send(grad.contiguous(), left), grad)[1])
-        initial_state = s_in
+        nk, nv, kdim, vdim = num_k_heads, num_v_heads, key_dim, value_dim
 
-    out, final_state = kernel(
-        query, key, value, g=g, beta=beta,
-        initial_state=initial_state, output_final_state=True,
+    seq_len = mixed_qkv.shape[1]
+    k_minus_1 = conv_weight.shape[-1] - 1
+    conv_dim_local = mixed_qkv.shape[-1]
+
+    # Depthwise causal conv over the (now full, natural-order) sequence.
+    x = mixed_qkv.transpose(1, 2)  # [B, conv_dim_local, S]
+    x = F.conv1d(x, conv_weight, bias=None, padding=k_minus_1, groups=conv_dim_local)
+    x = x[..., :seq_len]
+    x = F.silu(x).transpose(1, 2)  # [B, S, conv_dim_local]
+
+    query, key, value = torch.split(x, [kdim, kdim, vdim], dim=-1)
+    query = query.reshape(batch_size, seq_len, nk, head_k_dim)
+    key = key.reshape(batch_size, seq_len, nk, head_k_dim)
+    value = value.reshape(batch_size, seq_len, nv, head_v_dim)
+
+    beta = b.sigmoid()
+    # float32: A_log.exp() can overflow in bf16/fp16.
+    g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+    if nv // nk > 1:
+        query = query.repeat_interleave(nv // nk, dim=2)
+        key = key.repeat_interleave(nv // nk, dim=2)
+
+    core_attn_out, _ = kernel(
+        query,
+        key,
+        value,
+        g=g,
+        beta=beta,
+        initial_state=None,
+        output_final_state=False,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
-    # Keep _SendFinalState in the graph so its backward (recv dstate) runs.
-    coupling = _SendFinalState.apply(final_state.to(state_dtype), cp_group)
-    return out + coupling
+    core_attn_out = core_attn_out.reshape(-1, head_v_dim)
+    z_flat = z.reshape(-1, head_v_dim)
+    core_attn_out = norm(core_attn_out, z_flat)
+    core_attn_out = core_attn_out.reshape(batch_size, seq_len, nv * head_v_dim)
+
+    if cp_size > 1:
+        # head-sharded full sequence -> seq-sharded all-heads (zigzag) for the residual.
+        core_attn_out = all_to_all_hp2cp(redo_zigzag(core_attn_out, cp_size), cp_group)
+
+    return core_attn_out
