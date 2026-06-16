@@ -49,6 +49,9 @@ def _make_layer(req: RecomputeRequest, cp_group=None) -> Qwen3_5MoeGatedDeltaNet
         rms_norm_eps=1e-6,
         cp_group=cp_group,
     ).to(device=torch.cuda.current_device(), dtype=torch.float32)
+    # FLA chunk kernels are bf16/fp16 only (TileLang fails to compile the bwd in
+    # float32); force the deterministic torch fallback for the float32 reference.
+    layer.use_fla = False
     return layer
 
 
