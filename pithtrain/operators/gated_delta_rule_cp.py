@@ -24,7 +24,7 @@ Backward mirrors forward with the direction reversed:
 For ``cp_size == 1`` every helper is a no-op and reduces to the single-rank path.
 """
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -173,6 +173,86 @@ class _SendFinalState(torch.autograd.Function):
         if ctx.right >= 0:
             _recv(dstate, ctx.right)
         return dstate, None
+
+
+# ---------------------------------------------------------------------------
+# Comm/compute split helpers for selective activation recompute (Increment 2)
+# ---------------------------------------------------------------------------
+# The key correctness property: during torch.utils.checkpoint recompute, the
+# re-run must NOT re-trigger cross-rank communication.  Split each CP-aware op
+# into a communication step (runs once, outside checkpoint) and a compute step
+# (checkpointable, takes the pre-fetched tensors as inputs).
+# ---------------------------------------------------------------------------
+
+
+def fetch_left_halo(x: torch.Tensor, halo: int, cp_group: dist.ProcessGroup) -> torch.Tensor:
+    """Communication step: prepend left neighbour's last ``halo`` columns.
+
+    Returns the haloed input ``[B, C, halo + S_local]``.  Call this BEFORE the
+    checkpoint boundary; pass the result as a saved input to the checkpointed
+    compute function so no re-communication happens during recompute.
+    """
+    if cp_group is None or dist.get_world_size(cp_group) == 1 or halo == 0:
+        return x
+    return _LeftHalo.apply(x, halo, cp_group)
+
+
+def conv_on_halo(conv1d: torch.nn.Conv1d, haloed_x: torch.Tensor, s_local: int) -> torch.Tensor:
+    """Compute step: apply causal conv on a pre-haloed input.  No communication.
+
+    ``haloed_x`` is either:
+    - ``[B, C, halo + S_local]`` (from ``fetch_left_halo`` with real halo), or
+    - ``[B, C, S_local]`` (when cp_size==1: ``fetch_left_halo`` is a no-op).
+
+    Returns ``[B, C, S_local]``.  Safe to put inside ``torch.utils.checkpoint``.
+    """
+    k_minus_1 = conv1d.kernel_size[0] - 1
+    has_halo = haloed_x.shape[-1] > s_local
+    if k_minus_1 == 0 or not has_halo:
+        # Single-rank path: conv1d carries its own left padding; trim to S_local.
+        return conv1d(haloed_x)[..., :s_local]
+    # Multi-rank path: halo already provides left context; skip the built-in padding.
+    return conv1d(haloed_x)[..., k_minus_1 : k_minus_1 + s_local]
+
+
+def recv_delta_state(
+    state_shape: tuple,
+    state_dtype: torch.dtype,
+    device: torch.device,
+    cp_group: dist.ProcessGroup,
+) -> Optional[torch.Tensor]:
+    """Communication step: receive initial recurrent state from left neighbour.
+
+    Returns a tensor with a backward hook that ships its gradient back left.
+    Returns ``None`` for rank 0 (no left neighbour) and for cp_size == 1.
+    Call this BEFORE the checkpoint boundary.
+    """
+    if cp_group is None or dist.get_world_size(cp_group) == 1:
+        return None
+    cp_rank, _, left, _ = _neighbor_global_ranks(cp_group)
+    if cp_rank == 0:
+        return None
+    s_in = torch.empty(state_shape, dtype=state_dtype, device=device)
+    _recv(s_in, left)
+    s_in.requires_grad_(True)
+    s_in.register_hook(lambda grad: (_send(grad.contiguous(), left), grad)[1])
+    return s_in
+
+
+def send_delta_state(
+    final_state: torch.Tensor,
+    state_dtype: torch.dtype,
+    cp_group: dist.ProcessGroup,
+) -> Optional[torch.Tensor]:
+    """Communication step: send final state to right neighbour.
+
+    Returns the coupling scalar from ``_SendFinalState`` (add it to the output
+    to keep the send node in the autograd graph).  Returns ``None`` for the
+    last rank and for cp_size == 1.  Call this AFTER the checkpoint boundary.
+    """
+    if cp_group is None or dist.get_world_size(cp_group) == 1:
+        return None
+    return _SendFinalState.apply(final_state.to(state_dtype), cp_group)
 
 
 def chunk_gated_delta_rule_cp(

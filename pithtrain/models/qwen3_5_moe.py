@@ -29,6 +29,10 @@ from pithtrain.operators.flash_attn_v4 import flash_attn_func
 from pithtrain.operators.gated_delta_rule_cp import (
     causal_conv_with_halo,
     chunk_gated_delta_rule_cp,
+    conv_on_halo,
+    fetch_left_halo,
+    recv_delta_state,
+    send_delta_state,
 )
 from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import (
@@ -293,6 +297,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.use_fla = chunk_gated_delta_rule is not None
         # Context-parallel process group (None / size-1 -> single-rank path).
         self.cp_group = cp_group
+        # Selective activation recompute: split CP comms outside checkpoint boundary.
+        self.use_selective_recompute = False
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
@@ -323,6 +329,11 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self.out_proj = LinearCls(self.value_dim, self.hidden_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_selective_recompute:
+            return self._forward_recompute(hidden_states)
+        return self._forward_standard(hidden_states)
+
+    def _forward_standard(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
         mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
@@ -374,6 +385,81 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+
+        return self.out_proj(core_attn_out)
+
+    def _forward_recompute(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Selective recompute forward: CP communications happen outside the checkpoint.
+
+        Splits each CP-aware op into:
+          1. Communication step (outside checkpoint): fetch halo, recv initial_state.
+          2. Compute step (inside checkpoint): conv + delta-rule kernel.
+          3. Communication step (outside checkpoint): send final_state.
+
+        During backward recompute the compute step re-runs with the pre-fetched tensors
+        as saved inputs, so no extra cross-rank communication is triggered.
+        """
+        import torch.utils.checkpoint as ckpt
+
+        batch_size, seq_len, _ = hidden_states.shape
+        kernel = chunk_gated_delta_rule if self.use_fla else torch_chunk_gated_delta_rule
+        state_shape = (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim)
+
+        # ---- Projection (local, outside checkpoint) ----
+        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        z = self.in_proj_z(hidden_states)
+        b = self.in_proj_b(hidden_states)
+        a = self.in_proj_a(hidden_states)
+
+        # ---- Communication step 1: fetch conv halo ----
+        k_minus_1 = self.conv1d.kernel_size[0] - 1
+        haloed_qkv = fetch_left_halo(mixed_qkv, k_minus_1, self.cp_group)
+
+        # ---- Communication step 2: receive initial recurrent state ----
+        initial_state = recv_delta_state(state_shape, torch.float32, hidden_states.device, self.cp_group)
+
+        # ---- Compute step (inside checkpoint) ----
+        # All inputs are pre-fetched tensors; no communication inside.
+        def _compute(haloed_qkv, z, b, a, *state_args):
+            # state_args is () or (initial_state,) to handle optional tensor.
+            _initial_state = state_args[0] if state_args else None
+
+            mixed_qkv_out = F.silu(conv_on_halo(self.conv1d, haloed_qkv, seq_len))
+            mixed_qkv_out = mixed_qkv_out.transpose(1, 2)
+
+            query, key, value = torch.split(
+                mixed_qkv_out, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+            )
+            query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
+            key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
+            value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+
+            beta = b.sigmoid()
+            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+            if self.num_v_heads // self.num_k_heads > 1:
+                query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+                key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+            core_out, final_st = kernel(
+                query, key, value, g=g, beta=beta,
+                initial_state=_initial_state, output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+
+            z_r = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
+            core_out = core_out.reshape(-1, self.head_v_dim)
+            z_r = z_r.reshape(-1, self.head_v_dim)
+            core_out = self.norm(core_out, z_r)
+            core_out = core_out.reshape(batch_size, seq_len, -1)
+            return core_out, final_st
+
+        ckpt_args = (haloed_qkv, z, b, a) + ((initial_state,) if initial_state is not None else ())
+        core_attn_out, final_state = ckpt.checkpoint(_compute, *ckpt_args, use_reentrant=False)
+
+        # ---- Communication step 3: send final state ----
+        coupling = send_delta_state(final_state, torch.float32, self.cp_group)
+        if coupling is not None:
+            core_attn_out = core_attn_out + coupling
 
         return self.out_proj(core_attn_out)
 
