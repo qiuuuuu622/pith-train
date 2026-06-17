@@ -44,6 +44,7 @@ training.scheduler = "CosineAnnealing"
 training.max_lr = 3.0e-4
 training.min_lr = 1.0e-5
 training.expert_cpu_offload = bool(_i("OFFLOAD", 1))
+training.precision_aware_optimizer = bool(_i("PRECISION_AWARE_OPT", 0))
 training.fuse_lmhead_ce = bool(_i("FUSE_CE", 0))
 training.fuse_lmhead_ce_chunks = _i("FUSE_CHUNKS", 8)
 training.recompute_mlp = bool(_i("RECOMPUTE_MLP", 0))

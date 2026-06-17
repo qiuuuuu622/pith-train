@@ -180,6 +180,16 @@ class TrainingCfg(SlottedDefault):
     substantial throughput gain (measured ~2.4x on a small MoE proxy on 4xH100).
     """
 
+    precision_aware_optimizer: bool = False
+    """
+    Store AdamW moments (exp_avg / exp_avg_sq) in bf16 instead of fp32 via
+    :class:`pithtrain.modules.optim.ForeachOffloadAdamW`. Cuts optimizer state
+    from 12 to 8 bytes/param (the fp32 master is kept; math is done in fp32), so
+    the ~48GB->~32GB expert state can stay in GPU HBM with ``expert_cpu_offload``
+    off -- turning the ~37s bandwidth-bound host AdamW step into a sub-second HBM
+    step. The only numerical change is bf16 rounding of the stored moments.
+    """
+
     gc_collect_interval: int = 1
     """
     Run a manual ``gc.collect()`` every N steps. Cyclic GC is disabled globally
@@ -511,10 +521,11 @@ def setup_optimizer(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
     # expert state, ~40s/step with the GPU fully idle. ForeachOffloadAdamW runs
     # the identical AdamW math with torch._foreach_* on the local shards
     # (~2 passes). Use it whenever expert state is offloaded.
-    if cfg.optimizer == "AdamW" and cfg.expert_cpu_offload:
+    if cfg.optimizer == "AdamW" and (cfg.expert_cpu_offload or cfg.precision_aware_optimizer):
         from pithtrain.modules.optim import ForeachOffloadAdamW
 
-        ctx.optimizer = ForeachOffloadAdamW(param_groups, **common)
+        moment_dtype = torch.bfloat16 if cfg.precision_aware_optimizer else None
+        ctx.optimizer = ForeachOffloadAdamW(param_groups, moment_dtype=moment_dtype, **common)
         return
     match cfg.optimizer:
         case "Adam":

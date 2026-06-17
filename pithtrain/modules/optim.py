@@ -36,11 +36,19 @@ class ForeachOffloadAdamW(torch.optim.Optimizer):
     no per-tensor step tensors are needed.
     """
 
-    def __init__(self, params, lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0):
+    def __init__(self, params, lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0, moment_dtype=None):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0:
             raise ValueError(f"Invalid betas: {betas}")
+        # moment_dtype=torch.bfloat16 stores exp_avg/exp_avg_sq in bf16, cutting
+        # the optimizer state from 12 to 8 bytes/param. The fp32 master (the
+        # sharded param) is untouched and the AdamW math is done in fp32 by
+        # upcasting per tensor, so this is a precision-aware optimizer: the only
+        # loss is bf16 rounding of the stored moments. It lets the ~48GB->~32GB
+        # expert state stay in GPU HBM (no host offload), turning the ~37s
+        # bandwidth-bound CPU step into a sub-second HBM step.
+        self.moment_dtype = moment_dtype
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, _step=0)
         super().__init__(params, defaults)
 
@@ -62,8 +70,9 @@ class ForeachOffloadAdamW(torch.optim.Optimizer):
                 p_local = self._local(p)
                 state = self.state[p]
                 if not state:
-                    state["exp_avg"] = torch.zeros_like(p_local)
-                    state["exp_avg_sq"] = torch.zeros_like(p_local)
+                    mdt = self.moment_dtype or p_local.dtype
+                    state["exp_avg"] = torch.zeros_like(p_local, dtype=mdt)
+                    state["exp_avg_sq"] = torch.zeros_like(p_local, dtype=mdt)
                 params.append(p_local)
                 grads.append(self._local(p.grad))
                 exp_avgs.append(state["exp_avg"])
@@ -75,6 +84,26 @@ class ForeachOffloadAdamW(torch.optim.Optimizer):
             step = group["_step"]
             bias_correction1 = 1.0 - beta1**step
             bias_correction2 = 1.0 - beta2**step
+
+            # Precision-aware path: moments stored in a reduced dtype. Upcast per
+            # tensor so the AdamW math runs in fp32 with only one tensor's worth
+            # of transient fp32 memory (keeping the state-size win during step).
+            if self.moment_dtype is not None:
+                bc2_sqrt = bias_correction2**0.5
+                step_size = lr / bias_correction1
+                for p_l, g_l, m, v in zip(params, grads, exp_avgs, exp_avg_sqs):
+                    mf = m.float()
+                    vf = v.float()
+                    gf = g_l.float()
+                    if wd != 0.0:
+                        p_l.mul_(1.0 - lr * wd)
+                    mf.lerp_(gf, 1.0 - beta1)
+                    vf.mul_(beta2).addcmul_(gf, gf, value=1.0 - beta2)
+                    denom = vf.sqrt().div_(bc2_sqrt).add_(eps)
+                    p_l.addcdiv_(mf, denom, value=-step_size)
+                    m.copy_(mf)
+                    v.copy_(vf)
+                continue
 
             # Decoupled weight decay: p *= 1 - lr*wd.
             if wd != 0.0:

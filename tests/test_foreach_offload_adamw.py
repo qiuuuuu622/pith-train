@@ -39,6 +39,28 @@ def test_matches_torch_adamw():
             torch.testing.assert_close(op, rp, rtol=1e-5, atol=1e-6)
 
 
+def test_bf16_moments_close_to_fp32():
+    # Precision-aware path (bf16 moments, fp32 master + math) must track the
+    # fp32 reference closely -- only bf16 rounding of the stored moments differs.
+    ref_params = _make_params(3)
+    ours_params = [p.detach().clone().requires_grad_(True) for p in ref_params]
+    cfg = dict(lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
+    ref = torch.optim.AdamW(ref_params, **cfg)
+    ours = ForeachOffloadAdamW(ours_params, moment_dtype=torch.bfloat16, **cfg)
+    torch.manual_seed(99)
+    for _ in range(25):
+        for rp, op in zip(ref_params, ours_params):
+            g = torch.randn_like(rp)
+            rp.grad = g.clone()
+            op.grad = g.clone()
+        ref.step()
+        ours.step()
+    # Master stays fp32; bf16 moment rounding only perturbs the update slightly.
+    for rp, op in zip(ref_params, ours_params):
+        assert op.dtype == torch.float32
+        torch.testing.assert_close(op, rp, rtol=3e-2, atol=2e-3)
+
+
 def test_param_groups_distinct_wd():
     # decay group + no-decay group, like build_param_groups.
     ps = _make_params(7)
