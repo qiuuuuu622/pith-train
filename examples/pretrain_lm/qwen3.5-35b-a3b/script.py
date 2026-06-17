@@ -43,13 +43,19 @@ training.adam_beta2 = 0.95
 training.scheduler = "CosineAnnealing"
 training.max_lr = 3.0e-4
 training.min_lr = 1.0e-5
-training.expert_cpu_offload = bool(_i("OFFLOAD", 1))
-training.precision_aware_optimizer = bool(_i("PRECISION_AWARE_OPT", 0))
-training.offload_head = bool(_i("OFFLOAD_HEAD", 0))
-training.fuse_lmhead_ce = bool(_i("FUSE_CE", 0))
-training.fuse_lmhead_ce_chunks = _i("FUSE_CHUNKS", 8)
-training.recompute_mlp = bool(_i("RECOMPUTE_MLP", 0))
-training.recompute_attn = bool(_i("RECOMPUTE_ATTN", 0))
+# Best seq8192 config on 8xH100 (MFU 0.6% -> 2.3% at GBS16): keep the expert
+# optimizer state in HBM (OFFLOAD=0) with bf16 moments (PRECISION_AWARE_OPT) so
+# the AdamW step runs on HBM (~1.7s) instead of the ~37s host-bandwidth-bound
+# path; offload only the large embed/lm_head optimizer state (OFFLOAD_HEAD) to
+# relieve the edge pipeline stages; recompute mlp+attn to fit the long sequence;
+# FUSE_CHUNKS=32 trims the fused-CE activation peak on the lm_head stage.
+training.expert_cpu_offload = bool(_i("OFFLOAD", 0))
+training.precision_aware_optimizer = bool(_i("PRECISION_AWARE_OPT", 1))
+training.offload_head = bool(_i("OFFLOAD_HEAD", 1))
+training.fuse_lmhead_ce = bool(_i("FUSE_CE", 1))
+training.fuse_lmhead_ce_chunks = _i("FUSE_CHUNKS", 32)
+training.recompute_mlp = bool(_i("RECOMPUTE_MLP", 1))
+training.recompute_attn = bool(_i("RECOMPUTE_ATTN", 1))
 training.warmup_steps = _i("WARMUP", 2)
 training.max_steps = _i("STEPS", 10)
 training.micro_batch_size = _i("MBS", 1)
