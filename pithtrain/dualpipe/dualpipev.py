@@ -151,8 +151,12 @@ class DualPipeV(nn.Module):
         # Set pre-allocated intermediate_tensors on module to avoid FSDP kwarg handling issues
         intermediate_tensors = self.intermediate_tensors_chunks[phase][chunk_id]
         self.module[phase]._intermediate_tensors = intermediate_tensors
+        # Hand the last-stage module its labels so the epilog can fuse lm_head+CE.
+        if is_last_stage and self.criterion is not None:
+            self.module[phase]._labels = self.labels[chunk_id][0]
         outputs = self.module[phase](*inputs)
         self.module[phase]._intermediate_tensors = None
+        self.module[phase]._labels = None
         outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
         if is_last_stage and self.criterion is not None:
             labels = self.labels[chunk_id]
@@ -256,6 +260,9 @@ class DualPipeV(nn.Module):
         nvtx.range_push(
             f"forward chunk {chunk_id0} (phase{phase0}) backward chunk {chunk_id1} (phase{phase1})"
         )
+        # Hand the forward module its labels so its epilog can fuse lm_head+CE.
+        if is_last_stage0 and criterion0 is not None:
+            module0._labels = labels0[0]
         outputs0, loss0, input_grads1 = overlapped_forward_backward(
             module0,
             inputs0,
@@ -270,6 +277,7 @@ class DualPipeV(nn.Module):
             self.comm_stream,
             self.ep_group,
         )
+        module0._labels = None
         nvtx.range_pop()
 
         # post-forward

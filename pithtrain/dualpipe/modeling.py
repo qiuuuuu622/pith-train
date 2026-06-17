@@ -19,6 +19,7 @@ from pithtrain.dualpipe.execution import (
     Stage5Args,
     Stage5Outs,
     Stage5Record,
+    maybe_recompute_mlp,
 )
 from pithtrain.dualpipe.utils import run_backward
 from pithtrain.layers.factory import ModelImplMode
@@ -138,14 +139,16 @@ def decoder_layer_forward(
     if has_experts and fwd_comm_work is not None:
         sorted_tokens.untyped_storage().resize_(0)
 
-    moe_outs = layer.forward_mlp(gathered_tokens, expert_idxs, expand_idx)
+    moe_outs = maybe_recompute_mlp(layer, gathered_tokens, expert_idxs, expand_idx)
 
     record.outs = Stage3Outs(moe_outs)
     # Free args storage - values no longer needed, only .grad is read after backward.
     # Only safe for MoE layers with EP: padded_index_gather is the first consumer and
     # doesn't save the input.  For dense layers or ep_size==1, gate_proj/up_proj may
     # save gathered_tokens directly, or it shares storage with sorted_tokens.
-    if has_experts and fwd_comm_work is not None:
+    # With recompute_mlp, checkpoint must retain gathered_tokens to replay the MLP, so
+    # do NOT free it (the large internal MLP activations are what recompute saves).
+    if has_experts and fwd_comm_work is not None and not ModelImplMode.recompute_mlp:
         gathered_tokens.untyped_storage().resize_(0)
     intermediate_tensors.stage3 = record
     nvtx.range_pop()

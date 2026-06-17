@@ -25,6 +25,7 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 from pithtrain.config import SlottedDefault
+from pithtrain.layers.factory import ModelImplMode
 from pithtrain.modules.checkpoint import (
     to_canonical_model,
     to_canonical_optim,
@@ -127,6 +128,10 @@ def get_global_batch(
 
 
 def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    # When lm_head+CE is fused, the model epilog already returns the scalar loss
+    # (the [N, V] logits never exist); forward it through unchanged.
+    if ModelImplMode.fuse_lmhead_ce:
+        return output
     output = output.view(-1, output.size(-1))
     target = target.view(-1)
     return cross_entropy(output, target, ignore_index=-100)
@@ -317,7 +322,10 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         torch.cuda.nvtx.range_push("; ".join(parts))
     start = cfg.training.memory_profile_start
     if start is not None and ctx.training.step == start:
-        torch.cuda.memory._record_memory_history(max_entries=65536, stacks="python")
+        import os as _os_rmh
+
+        _entries = int(_os_rmh.environ.get("MEMPROF_ENTRIES", "65536"))
+        torch.cuda.memory._record_memory_history(max_entries=_entries, stacks="python")
 
     device = torch.cuda.current_device()
     t0 = time.time()
@@ -376,6 +384,47 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     peak_gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
     peak_gpu_mem = torch.tensor(peak_gpu_mem, device=device)
     torch.distributed.all_reduce(peak_gpu_mem, op=torch.distributed.ReduceOp.MAX)
+
+    # Per-rank memory breakdown (torch vs non-torch) for diagnostics.
+    import os as _os_mem
+
+    if _os_mem.environ.get("MEM_DEBUG") and ctx.training.step == int(
+        _os_mem.environ.get("MEM_DEBUG_STEP", "3")
+    ):
+        from torch.distributed.tensor import DTensor as _DT
+
+        def _gpu_gb(tensors):
+            tot = 0
+            for _t in tensors:
+                if _t is None:
+                    continue
+                _tl = _t.to_local() if isinstance(_t, _DT) else _t
+                if _tl.is_cuda:
+                    tot += _tl.numel() * _tl.element_size()
+            return tot / 1024**3
+
+        _model = ctx.training.model
+        param_gb = _gpu_gb(_model.parameters())
+        grad_gb = _gpu_gb(p.grad for p in _model.parameters())
+        free_b, total_b = torch.cuda.mem_get_info()
+        dev_used = (total_b - free_b) / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        alloc = torch.cuda.memory_allocated() / 1024**3
+        peak = torch.cuda.max_memory_allocated() / 1024**3
+        d = ctx.distributed
+        line = (
+            "[MEM] rank=%d pp=%d/%d ep=%d/%d | param=%.1f grad=%.1f act≈%.1f | "
+            "alloc=%.1f peak=%.1f reserved=%.1f device=%.1f non_torch=%.1f GB"
+            % (
+                d.rank, d.pp_rank, d.pp_size, d.ep_rank, d.ep_size,
+                param_gb, grad_gb, max(0.0, alloc - param_gb - grad_gb),
+                alloc, peak, reserved, dev_used, dev_used - reserved,
+            )
+        )
+        for _r in range(torch.distributed.get_world_size()):
+            if d.rank == _r:
+                print(line, flush=True)
+            torch.distributed.barrier()
 
     # Collect the mean load balance loss (reduced across all ranks).
     # The tracked values include the coefficient: lb_coef * E * dot(f, p).

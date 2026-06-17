@@ -1,120 +1,60 @@
-# Adapted from NVIDIA TransformerEngine (Apache 2.0)
-# https://github.com/NVIDIA/TransformerEngine
-#   transformer_engine/common/triton/cross_entropy.py  (Triton kernels)
-#   transformer_engine/pytorch/triton/cross_entropy.py  (autograd wrapper)
-# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# Modifications: fused online-softmax + cross-entropy into a single kernel,
-# removed tensor-parallelism / label-smoothing / distributed support.
+"""In-place fused cross-entropy (mean reduction).
+
+Computes the per-token cross-entropy of ``[N, V]`` logits against ``[N]``
+targets and -- to avoid a second ``[N, V]`` activation -- overwrites the logit
+tensor in place with the loss gradient during the forward pass. Backward only
+scales that stored gradient by the incoming cotangent.
+
+History: a previous Triton implementation produced a numerically wrong gradient
+once enough rows ran concurrently (the loss was correct, but the gradient was
+nearly orthogonal to the true gradient -- a silent training-correctness bug with
+no regression test). This pure-PyTorch version computes the standard
+``(softmax - onehot) / n_nonignore`` gradient in fp32, tiled over the token
+dimension so peak extra memory stays ``O(chunk * V)``. It matches
+``F.cross_entropy(..., reduction="mean")`` exactly and is covered by
+``tests/test_cross_entropy.py``.
+"""
 
 import torch
-import triton
-import triton.language as tl
 
 
-@triton.jit
-def cross_entropy_fwd(
-    X_ptr,
-    X_stride,
-    Y_ptr,
-    Y_stride,
-    loss_ptr,
-    loss_stride,
-    n_cols,
-    n_non_ignore_ptr,
-    ignore_idx,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Fused cross-entropy forward: computes per-row loss and overwrites
-    the logit tensor in-place with mean-reduced gradients.
-
-    Each program processes one row (token position). The kernel performs
-    two passes over the vocabulary dimension:
-      1. Online softmax: numerically stable max (m) and sum-of-exp (d).
-      2. Gradient write: softmax(x_i) / N for all i, then correct the
-         target position to (softmax(x_y) - 1) / N.
-
-    The per-row loss is stored separately for later summation.
-    """
-    row = tl.program_id(0).to(tl.int64)
-    X_ptr += row * X_stride
-    y = tl.load(Y_ptr + row * Y_stride)
-
-    if y == ignore_idx:
-        for i in range(0, n_cols, BLOCK_SIZE):
-            X_offsets = i + tl.arange(0, BLOCK_SIZE)
-            tl.store(X_ptr + X_offsets, 0.0, mask=X_offsets < n_cols)
-        tl.store(loss_ptr + row * loss_stride, 0.0)
-        return
-
-    n_non_ignore: tl.float32 = tl.load(n_non_ignore_ptr).to(tl.float32)
-
-    m: tl.float32 = float("-inf")
-    d: tl.float32 = 0.0
-    for i in range(0, n_cols, BLOCK_SIZE):
-        X_offsets = i + tl.arange(0, BLOCK_SIZE)
-        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf")).to(
-            tl.float32
-        )
-        block_max = tl.max(X_block)
-        m_new = tl.maximum(m, block_max)
-        d = d * tl.exp(m - m_new) + tl.sum(tl.exp(X_block - m_new))
-        m = m_new
-
-    ori_X_y = tl.load(X_ptr + y).to(tl.float32)
-
-    for i in range(0, n_cols, BLOCK_SIZE):
-        X_offsets = i + tl.arange(0, BLOCK_SIZE)
-        X_block = tl.load(X_ptr + X_offsets, mask=X_offsets < n_cols, other=float("-inf"))
-        grad_dtype = X_block.dtype
-        X_block = (tl.exp(X_block.to(tl.float32) - m) / d) / n_non_ignore
-        tl.store(X_ptr + X_offsets, X_block.to(grad_dtype), mask=X_offsets < n_cols)
-
-    X_y = tl.load(X_ptr + y)
-    X_y += -1.0 / n_non_ignore
-    tl.store(X_ptr + y, X_y)
-
-    loss = -(ori_X_y - m - tl.log(d))
-    tl.store(loss_ptr + row * loss_stride, loss)
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
 
 class CrossEntropy(torch.autograd.Function):
-    """
-    Fused cross-entropy that overwrites the logit tensor with gradients
-    during the forward pass so no extra activation memory is needed.
-    """
+    """Mean cross-entropy that overwrites the logits with their gradient."""
 
     @staticmethod
-    def forward(ctx, inp, target, ignore_index):
-        n_rows, n_cols = inp.shape
+    def forward(ctx, inp, target, ignore_index, num_chunks=8):
+        N, _ = inp.shape
+        target = target.reshape(-1)
+        assert target.shape[0] == N, (target.shape, N)
+        n_non_ignore = (target != ignore_index).sum().clamp(min=1).to(torch.float32)
 
-        if inp.stride(-1) != 1 or inp.stride(-2) != n_cols:
-            inp = inp.contiguous()
-        if target.stride(-1) != 1:
-            target = target.contiguous()
+        loss = torch.zeros((), dtype=torch.float32, device=inp.device)
+        chunk = _ceil_div(N, num_chunks)
+        for s in range(0, N, chunk):
+            e = min(s + chunk, N)
+            t = target[s:e]
+            valid = t != ignore_index
+            t_safe = t.clamp(min=0)
 
-        n_non_ignore = (target != ignore_index).sum(dtype=torch.int64).view(1)
-        n_non_ignore.clamp_(min=1)
+            logits = inp[s:e].float()  # [c, V]
+            m = logits.max(dim=-1, keepdim=True).values
+            exp = torch.exp(logits - m)
+            denom = exp.sum(dim=-1, keepdim=True)  # [c, 1]
+            true_logit = logits.gather(-1, t_safe[:, None])  # [c, 1]
+            nll = (m + denom.log()) - true_logit
+            loss += torch.where(valid[:, None], nll, torch.zeros_like(nll)).sum()
 
-        loss_1d = torch.zeros(n_rows, dtype=torch.float32, device=inp.device)
-        BLOCK_SIZE = min(65536 // 2, triton.next_power_of_2(n_cols))
+            grad = exp / denom  # softmax, [c, V]
+            grad = torch.where(valid[:, None], grad, torch.zeros_like(grad))
+            grad.scatter_add_(-1, t_safe[:, None], torch.where(valid, -1.0, 0.0)[:, None])
+            # Store (softmax - onehot) / n_nonignore back into the logits in place.
+            inp[s:e] = (grad / n_non_ignore).to(inp.dtype)
 
-        cross_entropy_fwd[(n_rows,)](
-            X_ptr=inp,
-            X_stride=inp.stride(-2),
-            Y_ptr=target,
-            Y_stride=target.stride(-1),
-            loss_ptr=loss_1d,
-            loss_stride=loss_1d.stride(-1),
-            n_cols=n_cols,
-            n_non_ignore_ptr=n_non_ignore,
-            ignore_idx=ignore_index,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=32,
-        )
-
-        loss = loss_1d.sum() / n_non_ignore.float().squeeze()
+        loss = loss / n_non_ignore
         ctx.save_for_backward(inp.detach())
         return loss
 
@@ -122,35 +62,34 @@ class CrossEntropy(torch.autograd.Function):
     def backward(ctx, grad_output):
         (inp,) = ctx.saved_tensors
         inp.mul_(grad_output.to(inp.dtype))
-        return inp, None, None
+        return inp, None, None, None
 
 
 def cross_entropy(
     inp: torch.Tensor,
     target: torch.Tensor,
     ignore_index: int = -100,
+    num_chunks: int = 8,
 ) -> torch.Tensor:
     """
     In-place fused cross-entropy loss with mean reduction.
 
     Overwrites ``inp`` with pre-computed gradients during the forward pass,
-    eliminating the need for a separate activation tensor.  All arithmetic
-    is performed in FP32; gradients are stored in the original dtype of
-    ``inp``.
+    eliminating the need for a separate activation tensor. All arithmetic is in
+    FP32; gradients are stored in the original dtype of ``inp``. Equivalent to
+    ``F.cross_entropy(inp.float(), target, ignore_index=ignore_index,
+    reduction="mean")``.
 
     Parameters
     ----------
     inp : torch.Tensor
-        Logits of shape ``(N, V)`` where N is the number of tokens and V is
-        the vocabulary size.  Modified in-place.
+        Logits of shape ``(N, V)``. Modified in place.
     target : torch.Tensor
-        Target indices of shape ``(N,)`` with values in ``[0, V-1]``.
+        Target indices of shape ``(N,)``; rows equal to ``ignore_index`` are
+        ignored in both loss and gradient.
     ignore_index : int
-        Target value that is ignored in loss and gradient computation.
-
-    Returns
-    -------
-    torch.Tensor
-        Scalar mean cross-entropy loss (float32).
+        Target value to ignore.
+    num_chunks : int
+        Token-dimension tiles; higher -> less peak memory.
     """
-    return CrossEntropy.apply(inp, target, ignore_index)
+    return CrossEntropy.apply(inp, target, ignore_index, num_chunks)

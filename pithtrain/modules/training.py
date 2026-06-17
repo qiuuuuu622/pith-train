@@ -20,6 +20,7 @@ from transformers import AutoConfig
 
 from pithtrain.config import SlottedDefault
 from pithtrain.dualpipe import DualPipeV, set_p2p_tensor_dtype, set_p2p_tensor_shapes
+from pithtrain.layers.factory import ModelImplMode
 from pithtrain.models.deepseek_v2_lite import DeepseekV2LiteModel
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_5_moe import Qwen3_5MoeModel
@@ -143,6 +144,32 @@ class TrainingCfg(SlottedDefault):
     """
     FP8 training backend: ``"disabled"`` (BF16 only) or ``"deep-gemm"`` (128-element
     block scaling via DeepGEMM). Supports SM90 (Hopper) and SM100+ (Blackwell).
+    """
+
+    fuse_lmhead_ce: bool = False
+    """
+    Fuse the lm_head projection with the cross-entropy loss so the ``[N, V]``
+    logits (V=248320 for Qwen3.5) are never materialized. Cuts activation memory
+    on the pipeline ranks that own the head; see
+    :mod:`pithtrain.operators.fused_linear_cross_entropy`.
+    """
+
+    fuse_lmhead_ce_chunks: int = 8
+    """Token-dimension tiles for the fused lm_head+CE; higher -> less peak memory."""
+
+    recompute_mlp: bool = False
+    """
+    Activation-recompute the expert MLP: don't store its forward activations (the
+    scatter buffer + grouped-GEMM intermediates, the largest single activation on
+    each rank); recompute them in backward. Trades ~1 extra MLP forward for a large
+    activation-memory saving, enabling longer sequences / larger batches.
+    """
+
+    recompute_attn: bool = False
+    """
+    Activation-recompute the attention / GatedDeltaNet block. This is the dominant
+    activation at long sequence length; enable together with ``recompute_mlp`` to
+    fit long sequences (e.g. 8k+) on a node.
     """
 
     expert_cpu_offload: bool = True
@@ -322,12 +349,18 @@ def apply_fsdp(
                 reshard_after_forward=True,
                 mp_policy=mp,
             )
+            # When fusing lm_head+CE, the head weight is captured by the fused
+            # op's autograd and re-read in backward, so it must stay unsharded
+            # across the backward (reshard would free the saved tensor).
             fully_shard(
                 model[i].lm_head,
                 mesh=other_fsdp_mesh,
-                reshard_after_forward=True,
+                reshard_after_forward=not ModelImplMode.fuse_lmhead_ce,
                 mp_policy=mp,
             )
+            # The fused lm_head+CE epilog enters through `fused_loss`, so FSDP
+            # must gather the head weight for that method too (not just forward).
+            torch.distributed.fsdp.register_fsdp_forward_method(model[i].lm_head, "fused_loss")
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
@@ -355,6 +388,10 @@ def setup_model(
     from pithtrain.layers.factory import ModelImplMode
 
     ModelImplMode.fp8_training = cfg.fp8_training
+    ModelImplMode.fuse_lmhead_ce = cfg.fuse_lmhead_ce
+    ModelImplMode.fuse_lmhead_ce_chunks = cfg.fuse_lmhead_ce_chunks
+    ModelImplMode.recompute_mlp = cfg.recompute_mlp
+    ModelImplMode.recompute_attn = cfg.recompute_attn
     if cfg.fp8_training != "disabled":
         FP8WeightCacheControl.enabled = True
 

@@ -20,6 +20,37 @@ from pithtrain.models.interface import DecoderLayerProtocol, ModelProtocol
 from pithtrain.operators.all_to_all import direct_all_to_all
 
 
+def maybe_recompute_mlp(layer, gathered_tokens, expert_idxs, expand_idx):
+    """Run the expert MLP, optionally under activation checkpointing.
+
+    When ``ModelImplMode.recompute_mlp`` is set the MLP forward is wrapped in
+    ``torch.utils.checkpoint`` so its large internal activations (the scatter
+    buffer and the grouped-GEMM intermediates) are not stored -- they are
+    replayed in backward. Only ``gathered_tokens`` (the MLP input) is retained.
+    Non-reentrant checkpointing composes with the DualPipeV deferred-wgrad path:
+    the recomputed activations feed the wgrad closure that runs at ``pop()``.
+    """
+    from pithtrain.layers.factory import ModelImplMode
+
+    if ModelImplMode.recompute_mlp:
+        from torch.utils.checkpoint import checkpoint
+
+        # use_reentrant=True wraps the MLP in a custom autograd Function whose
+        # backward recomputes the forward and runs a nested standard backward.
+        # That nested backward is what DualPipeV's low-level run_backward invokes,
+        # so the expert-linear wgrad deferral (WeightGradStore) fires correctly --
+        # unlike the saved-tensors-hook path of use_reentrant=False, which the raw
+        # execution-engine backward does not trigger.
+        return checkpoint(
+            layer.forward_mlp,
+            gathered_tokens,
+            expert_idxs,
+            expand_idx,
+            use_reentrant=True,
+        )
+    return layer.forward_mlp(gathered_tokens, expert_idxs, expand_idx)
+
+
 @dataclass(init=False, slots=True)
 class ExecutionCtx:
     """Shared context for the overlapped forward-backward execution loop."""
@@ -231,12 +262,19 @@ def stage3_f(
         ctx.fwd_comm_work.wait()
     _drain_deferred_free(ctx)
 
-    moe_outs = layer.forward_mlp(gathered_tokens, expert_idxs, expand_idx)
+    moe_outs = maybe_recompute_mlp(layer, gathered_tokens, expert_idxs, expand_idx)
     record.outs = Stage3Outs(moe_outs)
     # Free the args storage - only safe for MoE layers with EP where
     # padded_index_gather is the first consumer and doesn't save the input.
     # When ep_size==1, gathered_tokens shares storage with sorted_tokens.
-    if hasattr(layer.mlp, "experts") and ctx.fwd_comm_work is not None:
+    # With recompute_mlp, checkpoint must retain gathered_tokens to replay the MLP.
+    from pithtrain.layers.factory import ModelImplMode as _MIM
+
+    if (
+        hasattr(layer.mlp, "experts")
+        and ctx.fwd_comm_work is not None
+        and not _MIM.recompute_mlp
+    ):
         gathered_tokens.untyped_storage().resize_(0)
 
     ctx.comp_stream.record_event(ctx.fwd_event)
@@ -543,20 +581,38 @@ class EpilogRecord:
 
 def epilog_f(module: ModelProtocol, hidden_states: torch.Tensor):
     """
-    Epilog forward: norm + lm_head.
+    Epilog forward: norm + lm_head (or fused norm + lm_head + cross-entropy).
 
     The backward is handled by ``loss.backward()`` which traverses the autograd
     graph through norm -> lm_head -> criterion.  The only thing the caller needs
     from the record is ``args.hidden_states.grad`` (populated by autograd).
+
+    When ``ModelImplMode.fuse_lmhead_ce`` is set and the module carries per-chunk
+    labels (``module._labels``), this returns the scalar loss directly and never
+    materializes the ``[N, V]`` logits; the caller's pass-through criterion
+    forwards that loss unchanged.
     """
+    from pithtrain.layers.factory import ModelImplMode
+
     nvtx.range_push("epilog_f")
     record = EpilogRecord()
 
     hidden_states = hidden_states.detach().requires_grad_()
     record.args = EpilogArgs(hidden_states)
-    hidden_states = module.norm(hidden_states)
-    logits = module.lm_head(hidden_states)
+    normed = module.norm(hidden_states)
 
+    labels = getattr(module, "_labels", None)
+    if ModelImplMode.fuse_lmhead_ce and labels is not None:
+        hidden_dim = normed.shape[-1]
+        loss = module.lm_head.fused_loss(
+            normed.reshape(-1, hidden_dim),
+            labels.reshape(-1),
+            num_chunks=ModelImplMode.fuse_lmhead_ce_chunks,
+        )
+        nvtx.range_pop()
+        return record, loss
+
+    logits = module.lm_head(normed)
     nvtx.range_pop()
     return record, logits
 

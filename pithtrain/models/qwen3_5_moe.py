@@ -26,6 +26,7 @@ from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBa
 from pithtrain.operators.deepgemm_fp8_quantize import fused_blockwise_transpose_cast_to_fp8_batched
 from pithtrain.operators.ep_dispatch import moe_ep_prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func
+from pithtrain.operators.fused_linear_cross_entropy import fused_linear_cross_entropy
 from pithtrain.operators.gated_delta_rule_cp import head_parallel_gated_delta_net
 from pithtrain.operators.ring_attention import ring_attention_func
 from pithtrain.operators.silu_mul import silu_mul
@@ -777,7 +778,16 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
 
     def forward_attn(self, hidden_states: torch.Tensor) -> ForwardAttnOutput:
         """LN + token mixer + LN + shared expert + expert routing."""
-        hidden_states, residual = self._forward_attn_compute(hidden_states)
+        if ModelImplMode.recompute_attn:
+            # Recompute only the heavy attn/GDN compute; keep the router (gate)
+            # outside so its load-balance aux loss is not re-accumulated.
+            from torch.utils.checkpoint import checkpoint
+
+            hidden_states, residual = checkpoint(
+                self._forward_attn_compute, hidden_states, use_reentrant=True
+            )
+        else:
+            hidden_states, residual = self._forward_attn_compute(hidden_states)
 
         topk_ids, topk_weight = self.mlp.gate(hidden_states)
         (
@@ -872,6 +882,32 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class Qwen3_5MoeLMHead(nn.Module):
+    """Language-model head with an optional fused projection+cross-entropy path.
+
+    ``forward`` returns logits (inference / ``return_outputs``). ``fused_loss``
+    returns the scalar cross-entropy without ever materializing the ``[N, V]``
+    logits -- used during training when ``ModelImplMode.fuse_lmhead_ce`` is set.
+    The parameter is named ``weight`` (shape ``[V, H]``) so checkpoint FQNs match
+    the ``nn.Linear`` it replaces. FSDP gathers ``weight`` for either entry point
+    because both are registered as FSDP forward methods.
+    """
+
+    def __init__(self, hidden_size: int, vocab_size: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(vocab_size, hidden_size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight)
+
+    def fused_loss(
+        self, hidden_2d: torch.Tensor, target: torch.Tensor, num_chunks: int = 8
+    ) -> torch.Tensor:
+        return fused_linear_cross_entropy(
+            hidden_2d, self.weight, target, ignore_index=-100, num_chunks=num_chunks
+        )
+
+
 class Qwen3_5MoeModel(nn.Module):
     """Qwen3.5 MoE text model for DualPipeV pipeline parallelism."""
 
@@ -940,10 +976,14 @@ class Qwen3_5MoeModel(nn.Module):
 
         if stage_id == num_stages - 1:
             self.norm = Qwen3_5MoeRMSNorm(hidden_size, eps=rms_norm_eps)
-            self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+            self.lm_head = Qwen3_5MoeLMHead(hidden_size, vocab_size)
         else:
             self.norm = None
             self.lm_head = None
+
+        # Per-chunk labels for the fused lm_head+CE epilog; set by DualPipeV
+        # before the last-stage forward, cleared after.
+        self._labels = None
 
         self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(
             int(head_dim * partial_rotary_factor),
@@ -1023,8 +1063,17 @@ class Qwen3_5MoeModel(nn.Module):
             if not ModelImplMode.use_reference_fwd:
                 hidden_states = hidden_states.detach().requires_grad_()
             intermediate_tensors.epilog.args = EpilogArgs(hidden_states)
-            hidden_states = self.norm(hidden_states)
-            hidden_states = self.lm_head(hidden_states)
+            normed = self.norm(hidden_states)
+            if ModelImplMode.fuse_lmhead_ce and self._labels is not None:
+                # Return the scalar loss directly; the [N, V] logits are never
+                # materialized. The pass-through criterion forwards this loss.
+                hidden_dim = normed.shape[-1]
+                return self.lm_head.fused_loss(
+                    normed.reshape(-1, hidden_dim),
+                    self._labels.reshape(-1),
+                    num_chunks=ModelImplMode.fuse_lmhead_ce_chunks,
+                )
+            hidden_states = self.lm_head(normed)
 
         return hidden_states
 
