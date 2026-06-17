@@ -180,6 +180,16 @@ class TrainingCfg(SlottedDefault):
     substantial throughput gain (measured ~2.4x on a small MoE proxy on 4xH100).
     """
 
+    offload_head: bool = False
+    """
+    Offload only the embedding / lm_head optimizer state + weights to host RAM.
+    These vocab x hidden tensors are the largest dense params and sit on the edge
+    pipeline stages, which OOM first when the expert state is kept on device. Their
+    param count is small so the host AdamW for them is cheap -- this relieves the
+    edge ranks without putting the expensive expert step back on the host path.
+    Pair with ``precision_aware_optimizer`` + ``expert_cpu_offload=False``.
+    """
+
     precision_aware_optimizer: bool = False
     """
     Store AdamW moments (exp_avg / exp_avg_sq) in bf16 instead of fp32 via
@@ -309,6 +319,7 @@ def apply_fsdp(
     mesh: DeviceMesh,
     sharding_strategy: Literal["fsdp", "hsdp"] = "fsdp",
     expert_cpu_offload: bool = True,
+    offload_head: bool = False,
 ):
     # MoE params: unique per EP rank, replicated across DP x CP.
     # Non-MoE params: replicated across DP x CP x EP.
@@ -339,6 +350,13 @@ def apply_fsdp(
     # (needed to fit large models), but adds a CPU<->GPU copy on the critical path
     # every step; disable it when the model fits on device for a large throughput win.
     expert_offload = CPUOffloadPolicy(pin_memory=True) if expert_cpu_offload else None
+    # The embedding / lm_head are the largest dense tensors (vocab x hidden) and
+    # live only on the edge pipeline stages, so those ranks OOM first when the
+    # expert optimizer state is kept on device (expert_cpu_offload=False). Offload
+    # just the head optimizer state/weights to host RAM to relieve the edge ranks
+    # without putting the 37s expert step back on the slow host path. Their param
+    # count is small so the host AdamW for them is cheap.
+    head_offload = CPUOffloadPolicy(pin_memory=True) if offload_head else None
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
         assert isinstance(
@@ -350,6 +368,7 @@ def apply_fsdp(
                 mesh=other_fsdp_mesh,
                 reshard_after_forward=True,
                 mp_policy=mp,
+                offload_policy=head_offload,
             )
         if model[i].norm is not None:
             assert model[i].lm_head is not None
@@ -367,6 +386,7 @@ def apply_fsdp(
                 mesh=other_fsdp_mesh,
                 reshard_after_forward=not ModelImplMode.fuse_lmhead_ce,
                 mp_policy=mp,
+                offload_policy=head_offload,
             )
             # The fused lm_head+CE epilog enters through `fused_loss`, so FSDP
             # must gather the head weight for that method too (not just forward).
@@ -477,6 +497,7 @@ def setup_model(
         device_mesh,
         distributed_cfg.sharding_strategy,
         expert_cpu_offload=cfg.expert_cpu_offload,
+        offload_head=cfg.offload_head,
     )
 
     local_seq_len = cfg.sequence_length // cp_size

@@ -63,7 +63,13 @@ class DualPipeV(nn.Module):
         super().__init__()
 
         device = torch.device(torch.cuda.current_device())
-        assert next(modules[0].parameters()).device == device
+        # The first param must be on this rank's CUDA device, unless it is an
+        # FSDP CPUOffloadPolicy shard (kept on host, gathered to GPU on demand) --
+        # as when offload_head moves the embedding optimizer state off the edge
+        # stage. A plain CPU tensor (forgot .to(cuda)) on the *non*-offloaded path
+        # would instead surface downstream when FSDP fails to find it on device.
+        p0_device = next(modules[0].parameters()).device
+        assert p0_device == device or p0_device.type == "cpu"
         self.module = nn.ModuleList(modules)
         self.batch_dim = 0
         self.rank = torch.distributed.get_rank()

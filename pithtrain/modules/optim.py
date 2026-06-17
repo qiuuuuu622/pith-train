@@ -191,9 +191,19 @@ def scale_and_clip_grad_norm_(
         device = first.device if first is not None else torch.device("cpu")
         return torch.tensor(0.0, device=device)
 
-    local_norm = torch.nn.utils.get_total_norm(grads, norm_type=norm_type)
+    # Grads may span devices: offloaded shards (e.g. offload_head) live on CPU
+    # while expert/other shards are on GPU. Reduce the per-tensor norms onto the
+    # CUDA device so the (NCCL) all-reduce never sees a CPU tensor.
+    reduce_device = (
+        torch.device(torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else grads[0].device
+    )
+    per_tensor_pow = [
+        torch.linalg.vector_norm(g, norm_type).to(reduce_device) ** norm_type for g in grads
+    ]
     # Global L2 norm: all-reduce the sum of squared local norms (FSDP + pipeline).
-    local_norm_pow = local_norm**norm_type
+    local_norm_pow = torch.stack(per_tensor_pow).sum()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(local_norm_pow, op=dist.ReduceOp.SUM)
     unscaled_norm = local_norm_pow ** (1.0 / norm_type)
