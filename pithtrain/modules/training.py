@@ -14,7 +14,7 @@ import torch.distributed.fsdp
 import torch.nn as nn
 from torch.distributed import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
-from torch.optim import Adam, Optimizer
+from torch.optim import Adam, AdamW, Optimizer
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, LRScheduler, SequentialLR
 from transformers import AutoConfig
 
@@ -63,8 +63,27 @@ class TrainingCfg(SlottedDefault):
     Gradients will be accumulated over multiple micro-batches to achieve this batch size.
     """
 
-    optimizer: Literal["Adam"]
+    optimizer: Literal["Adam", "AdamW"]
     """The optimizer to use during training."""
+
+    weight_decay: float = 0.1
+    """
+    Decoupled weight decay (AdamW) or L2 penalty (Adam). Applied only to
+    matrix-like parameters (dim >= 2); LayerNorm/RMSNorm weights and biases are
+    excluded via :func:`pithtrain.modules.optim.build_param_groups`.
+    """
+
+    adam_beta1: float = 0.9
+    """Adam/AdamW first-moment decay (momentum)."""
+
+    adam_beta2: float = 0.95
+    """
+    Adam/AdamW second-moment decay. The LLM-pretraining convention is 0.95
+    (PyTorch's 0.999 default is too slow to adapt at large batch sizes).
+    """
+
+    adam_eps: float = 1e-8
+    """Adam/AdamW denominator epsilon."""
 
     scheduler: Literal["CosineAnnealing", "Constant"]
     """The learning rate scheduler to use after linear warmup."""
@@ -132,6 +151,15 @@ class TrainingCfg(SlottedDefault):
     CPUOffloadPolicy. Keeps large models within HBM but adds a CPU<->GPU copy on
     the critical path each step. Set ``False`` when the model fits on device for a
     substantial throughput gain (measured ~2.4x on a small MoE proxy on 4xH100).
+    """
+
+    gc_collect_interval: int = 1
+    """
+    Run a manual ``gc.collect()`` every N steps. Cyclic GC is disabled globally
+    during training (see ``training_context``) and collected manually between
+    steps so it never fires mid forward/backward. The default of 1 (every step)
+    is the conservative, memory-safe setting; raise it to amortize the per-step
+    CPU stall once you have confirmed live memory is stable across steps.
     """
 
     init_std: float = 0.02
@@ -434,8 +462,18 @@ def setup_model(
 
 
 def setup_optimizer(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
-    model, max_lr = ctx.model, cfg.max_lr
-    ctx.optimizer = Adam(model.parameters(), lr=max_lr)
+    from pithtrain.modules.optim import build_param_groups
+
+    param_groups = build_param_groups(ctx.model, cfg.weight_decay)
+    betas = (cfg.adam_beta1, cfg.adam_beta2)
+    common = dict(lr=cfg.max_lr, betas=betas, eps=cfg.adam_eps)
+    match cfg.optimizer:
+        case "Adam":
+            ctx.optimizer = Adam(param_groups, **common)
+        case "AdamW":
+            ctx.optimizer = AdamW(param_groups, **common)
+        case _:
+            raise ValueError(f"Unknown optimizer: {cfg.optimizer!r}")
 
 
 def setup_scheduler(cfg: TrainingCfg, ctx: TrainingCtx) -> None:

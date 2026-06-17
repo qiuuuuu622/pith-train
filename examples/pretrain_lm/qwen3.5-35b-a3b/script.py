@@ -16,7 +16,10 @@ distributed.expert_parallel_size = 2
 
 training = cfg.training
 training.model = Path("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
-training.optimizer = "Adam"
+training.optimizer = "AdamW"
+training.weight_decay = 0.1
+training.adam_beta1 = 0.9
+training.adam_beta2 = 0.95
 training.scheduler = "CosineAnnealing"
 training.max_lr = 3.0e-4
 training.min_lr = 1.0e-5

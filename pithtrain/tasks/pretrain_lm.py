@@ -12,7 +12,6 @@ import torch.cuda
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 import wandb
-from torch.distributed._tensor import DTensor
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -35,6 +34,7 @@ from pithtrain.modules.checkpoint import (
 from pithtrain.modules.distributed import DistributedCfg, DistributedCtx, distributed_context
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, LoggingCtx, activate_wandb, logging_context
+from pithtrain.modules.optim import scale_and_clip_grad_norm_
 from pithtrain.modules.training import TrainingCfg, TrainingCtx, training_context
 from pithtrain.operators.cross_entropy import cross_entropy
 
@@ -130,39 +130,6 @@ def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     output = output.view(-1, output.size(-1))
     target = target.view(-1)
     return cross_entropy(output, target, ignore_index=-100)
-
-
-@torch.no_grad()
-def clip_grad_norm_(model: nn.Module, max_norm: float, norm_type: float = 2.0) -> torch.Tensor:
-    """
-    Clip gradients by global norm across all ranks (FSDP + pipeline).
-    Returns the total gradient norm before clipping.
-    """
-    grads = []
-    for p in model.parameters():
-        if p.grad is None:
-            continue
-        g = p.grad
-        if isinstance(g, DTensor):
-            g = g.to_local()
-        grads.append(g)
-    if not grads:
-        first_param = next(model.parameters(), None)
-        device = first_param.device if first_param is not None else torch.device("cpu")
-        return torch.tensor(0.0, device=device)
-    local_norm = torch.nn.utils.get_total_norm(grads, norm_type=norm_type)
-    # Global L2 norm: all-reduce sum of squared norms across all ranks (FSDP + pipeline).
-    local_norm_sq = local_norm**norm_type
-    torch.distributed.all_reduce(local_norm_sq, op=torch.distributed.ReduceOp.SUM)
-    total_norm = (local_norm_sq ** (1.0 / norm_type)).clamp(min=1e-6)
-    clip_coef = (max_norm / total_norm).clamp(max=1.0)
-    if clip_coef < 1.0:
-        for p in model.parameters():
-            if p.grad is not None:
-                # Expert params use FSDP CPUOffloadPolicy, so their grads live on
-                # CPU while clip_coef is on the GPU; match each grad's device.
-                p.grad.mul_(clip_coef.to(p.grad.device))
-    return total_norm
 
 
 class AppState(Stateful):
@@ -388,15 +355,10 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
         torch.distributed.all_reduce(loss, group=cp_group)
         loss /= cp_size
 
-    # Scale gradients back so the effective loss is the mean over chunks.
-    if accumulate_steps > 1:
-        scale = 1.0 / accumulate_steps
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.mul_(scale)
-
-    # Clip the gradients.
-    gradient_norm = clip_grad_norm_(model, max_norm=1.0, norm_type=2)
+    # Fold the gradient-accumulation mean (1/accumulate_steps) and global-norm
+    # clipping into a single sweep over the (possibly CPU-offloaded) gradients.
+    scale = 1.0 / accumulate_steps if accumulate_steps > 1 else 1.0
+    gradient_norm = scale_and_clip_grad_norm_(model, scale=scale, max_norm=1.0, norm_type=2)
 
     # Take an optimization step.
     optimizer.step()
@@ -500,7 +462,10 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
             save_checkpoint(cfg, ctx)
 
     # Run deferred GC here so cyclic collection never fires mid-forward/backward.
-    gc.collect()
+    # Cadence is configurable so the per-step CPU stall can be amortized.
+    gc_interval = cfg.training.gc_collect_interval
+    if gc_interval > 0 and ctx.training.step % gc_interval == 0:
+        gc.collect()
 
 
 @record
