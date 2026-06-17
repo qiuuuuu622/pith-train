@@ -12,6 +12,87 @@ import torch.nn as nn
 from torch.distributed._tensor import DTensor
 
 
+class ForeachOffloadAdamW(torch.optim.Optimizer):
+    """AdamW whose update runs ``torch._foreach_*`` on local DTensor shards.
+
+    ``torch.optim.AdamW``'s ``foreach`` and ``fused`` paths reject FSDP2
+    CPU-offloaded ``DTensor`` parameters (the ``_foreach`` kernels have no
+    DTensor dispatch), so it silently falls back to the single-tensor path.
+    That path sweeps the optimizer state roughly once per arithmetic sub-op per
+    tensor -- for the 35B expert state (~4B fp32 params/rank, ~48GB) that is a
+    dozen full passes over host memory and measured at ~40s/step, which fully
+    exposes the GPU (it sits idle the whole time).
+
+    This optimizer unwraps each parameter / gradient to its *local* tensor with
+    ``DTensor.to_local()`` (a view onto the same storage, so in-place updates
+    propagate back to the sharded parameter) and runs the AdamW update with the
+    batched ``torch._foreach_*`` ops. The whole shard updates in ~2 memory
+    passes. The math is identical to ``torch.optim.AdamW`` (decoupled weight
+    decay, no amsgrad); see ``tests/test_foreach_offload_adamw.py`` for the
+    numerical-equivalence check against the reference.
+
+    All parameters in a group are stepped together every ``step()`` call, so a
+    single Python step counter per group drives the (scalar) bias correction --
+    no per-tensor step tensors are needed.
+    """
+
+    def __init__(self, params, lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid betas: {betas}")
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, _step=0)
+        super().__init__(params, defaults)
+
+    @staticmethod
+    def _local(t):
+        return t.to_local() if isinstance(t, DTensor) else t
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            lr, eps, wd = group["lr"], group["eps"], group["weight_decay"]
+
+            params, grads, exp_avgs, exp_avg_sqs = [], [], [], []
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                p_local = self._local(p)
+                state = self.state[p]
+                if not state:
+                    state["exp_avg"] = torch.zeros_like(p_local)
+                    state["exp_avg_sq"] = torch.zeros_like(p_local)
+                params.append(p_local)
+                grads.append(self._local(p.grad))
+                exp_avgs.append(state["exp_avg"])
+                exp_avg_sqs.append(state["exp_avg_sq"])
+            if not params:
+                continue
+
+            group["_step"] += 1
+            step = group["_step"]
+            bias_correction1 = 1.0 - beta1**step
+            bias_correction2 = 1.0 - beta2**step
+
+            # Decoupled weight decay: p *= 1 - lr*wd.
+            if wd != 0.0:
+                torch._foreach_mul_(params, 1.0 - lr * wd)
+            # m = beta1*m + (1-beta1)*g  (lerp toward g by 1-beta1).
+            torch._foreach_lerp_(exp_avgs, grads, 1.0 - beta1)
+            # v = beta2*v + (1-beta2)*g^2.
+            torch._foreach_mul_(exp_avg_sqs, beta2)
+            torch._foreach_addcmul_(exp_avg_sqs, grads, grads, 1.0 - beta2)
+            # denom = sqrt(v)/sqrt(bias_correction2) + eps.
+            denom = torch._foreach_sqrt(exp_avg_sqs)
+            torch._foreach_div_(denom, bias_correction2**0.5)
+            torch._foreach_add_(denom, eps)
+            # p += -(lr/bias_correction1) * m / denom.
+            torch._foreach_addcdiv_(params, exp_avgs, denom, -lr / bias_correction1)
+        return loss
+
+
 def build_param_groups(model: nn.Module, weight_decay: float) -> List[dict]:
     """
     Split parameters into weight-decay and no-weight-decay groups.

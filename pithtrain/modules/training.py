@@ -504,6 +504,18 @@ def setup_optimizer(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
     param_groups = build_param_groups(ctx.model, cfg.weight_decay)
     betas = (cfg.adam_beta1, cfg.adam_beta2)
     common = dict(lr=cfg.max_lr, betas=betas, eps=cfg.adam_eps)
+
+    # Under FSDP2 CPUOffloadPolicy the optimizer state lives on the host as
+    # DTensors. torch.optim's foreach / fused fast paths reject those, so AdamW
+    # silently runs the single-tensor path -- a dozen full passes over the ~48GB
+    # expert state, ~40s/step with the GPU fully idle. ForeachOffloadAdamW runs
+    # the identical AdamW math with torch._foreach_* on the local shards
+    # (~2 passes). Use it whenever expert state is offloaded.
+    if cfg.optimizer == "AdamW" and cfg.expert_cpu_offload:
+        from pithtrain.modules.optim import ForeachOffloadAdamW
+
+        ctx.optimizer = ForeachOffloadAdamW(param_groups, **common)
+        return
     match cfg.optimizer:
         case "Adam":
             ctx.optimizer = Adam(param_groups, **common)

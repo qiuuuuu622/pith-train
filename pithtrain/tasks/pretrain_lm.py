@@ -366,13 +366,25 @@ def train_step(cfg: PretrainLMCfg, ctx: PretrainLMCtx) -> None:
     # Fold the gradient-accumulation mean (1/accumulate_steps) and global-norm
     # clipping into a single sweep over the (possibly CPU-offloaded) gradients.
     scale = 1.0 / accumulate_steps if accumulate_steps > 1 else 1.0
+    _ot = __import__("os").environ.get("OPT_TIMING")
+    if _ot:
+        torch.cuda.synchronize()
+        _tc = time.perf_counter()
     gradient_norm = scale_and_clip_grad_norm_(model, scale=scale, max_norm=1.0, norm_type=2)
+    if _ot:
+        torch.cuda.synchronize()
+        _ts = time.perf_counter()
 
     # Take an optimization step.
     optimizer.step()
     scheduler.step()
     optimizer.zero_grad(set_to_none=True)
     MoELoadBalanceLossTracker.reset()
+    if _ot:
+        torch.cuda.synchronize()
+        _te = time.perf_counter()
+        if ctx.distributed.rank == 0:
+            print(f"OPT_TIMING clip={_ts - _tc:.2f}s step={_te - _ts:.2f}s", flush=True)
 
     # Measure the elapsed time in seconds.
     t1 = time.time()
