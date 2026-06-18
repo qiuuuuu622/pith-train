@@ -18,6 +18,51 @@ def _make_params(seed):
     return [torch.randn(s, requires_grad=True) for s in shapes]
 
 
+def test_stochastic_rounding_unbiased():
+    # Averaging many stochastic roundings of an fp32 tensor must recover it
+    # (unbiased), unlike round-to-nearest which has a fixed per-element bias.
+    torch.manual_seed(0)
+    x = torch.randn(50000) * 0.3 + 1.0  # ~O(1): bf16 ULP ~2^-8, values have sub-ULP parts
+    acc = torch.zeros(x.shape, dtype=torch.float64)
+    n = 400
+    for _ in range(n):
+        acc += ForeachOffloadAdamW._sr_to_bf16(x).float().double()
+    sr_mean = (acc / n).float()
+    rn = x.to(torch.bfloat16).float()
+    # SR mean is far closer to x than a single round-to-nearest.
+    assert (sr_mean - x).abs().mean() < 0.2 * (rn - x).abs().mean()
+    torch.testing.assert_close(sr_mean, x, atol=2e-3, rtol=0)
+
+
+def test_stochastic_rounding_preserves_exact():
+    # bf16-representable values must stay exact under stochastic rounding.
+    x = torch.tensor([0.0, 0.5, 1.0, 2.0, -4.0, 0.25, -0.5]).to(torch.bfloat16).float()
+    for _ in range(50):
+        out = ForeachOffloadAdamW._sr_to_bf16(x).float()
+        torch.testing.assert_close(out, x, atol=0.0, rtol=0.0)
+
+
+def test_sr_master_fp32_path_unchanged():
+    # stochastic_rounding=True with an fp32 master must stay bitwise-identical to
+    # torch.optim.AdamW: SR only affects bf16 destinations, and an fp32 master is
+    # written with a plain copy.
+    ref_params = _make_params(11)
+    ours_params = [p.detach().clone().requires_grad_(True) for p in ref_params]
+    cfg = dict(lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
+    ref = torch.optim.AdamW(ref_params, **cfg)
+    ours = ForeachOffloadAdamW(ours_params, stochastic_rounding=True, **cfg)  # fp32 moments+master
+    torch.manual_seed(7)
+    for _ in range(20):
+        for rp, op in zip(ref_params, ours_params):
+            g = torch.randn_like(rp)
+            rp.grad = g.clone()
+            op.grad = g.clone()
+        ref.step()
+        ours.step()
+        for rp, op in zip(ref_params, ours_params):
+            torch.testing.assert_close(op, rp, rtol=1e-5, atol=1e-6)
+
+
 def test_matches_torch_adamw():
     ref_params = _make_params(0)
     ours_params = [p.detach().clone().requires_grad_(True) for p in ref_params]

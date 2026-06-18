@@ -36,7 +36,16 @@ class ForeachOffloadAdamW(torch.optim.Optimizer):
     no per-tensor step tensors are needed.
     """
 
-    def __init__(self, params, lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0, moment_dtype=None):
+    def __init__(
+        self,
+        params,
+        lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=0.0,
+        moment_dtype=None,
+        stochastic_rounding=False,
+    ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0:
@@ -48,13 +57,40 @@ class ForeachOffloadAdamW(torch.optim.Optimizer):
         # loss is bf16 rounding of the stored moments. It lets the ~48GB->~32GB
         # expert state stay in GPU HBM (no host offload), turning the ~37s
         # bandwidth-bound CPU step into a sub-second HBM step.
+        #
+        # stochastic_rounding=True applies unbiased stochastic rounding when
+        # writing fp32 results back to a bf16 destination. This is what makes a
+        # bf16 *master* viable: with round-to-nearest, any per-step update smaller
+        # than the bf16 ULP (~2^-8 of the weight magnitude -- common once the LR
+        # has decayed) is silently dropped and training stalls; stochastic
+        # rounding preserves those updates in expectation. It frees a further
+        # ~16GB (no fp32 master) for a larger micro-batch.
         self.moment_dtype = moment_dtype
+        self.stochastic_rounding = stochastic_rounding
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, _step=0)
         super().__init__(params, defaults)
 
     @staticmethod
     def _local(t):
         return t.to_local() if isinstance(t, DTensor) else t
+
+    @staticmethod
+    def _sr_to_bf16(x: torch.Tensor) -> torch.Tensor:
+        """Stochastically round fp32 ``x`` to bf16 via the bit trick: add uniform
+        noise across the 16 truncated mantissa bits, then truncate. A value k/2^16
+        of the way to the next bf16 rounds up with probability k/2^16, so rounding
+        is unbiased. Exactly-representable values (low 16 bits zero) stay exact."""
+        xi = x.contiguous().view(torch.int32)
+        noise = torch.randint(0, 1 << 16, x.shape, dtype=torch.int32, device=x.device)
+        return ((xi + noise) & -65536).view(torch.float32).to(torch.bfloat16)
+
+    @classmethod
+    def _store(cls, dst: torch.Tensor, src_fp32: torch.Tensor, stochastic: bool) -> None:
+        """Write fp32 ``src_fp32`` into ``dst`` (possibly low precision)."""
+        if stochastic and dst.dtype == torch.bfloat16:
+            dst.copy_(cls._sr_to_bf16(src_fp32))
+        else:
+            dst.copy_(src_fp32)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -85,24 +121,31 @@ class ForeachOffloadAdamW(torch.optim.Optimizer):
             bias_correction1 = 1.0 - beta1**step
             bias_correction2 = 1.0 - beta2**step
 
-            # Precision-aware path: moments stored in a reduced dtype. Upcast per
-            # tensor so the AdamW math runs in fp32 with only one tensor's worth
-            # of transient fp32 memory (keeping the state-size win during step).
-            if self.moment_dtype is not None:
+            # Precision-aware path: moments (and optionally the master) stored in a
+            # reduced dtype. Upcast per tensor so the AdamW math runs in fp32 with
+            # only one tensor's worth of transient fp32 memory (keeping the
+            # state-size win during step), then write back, stochastically rounding
+            # bf16 destinations when enabled. For an fp32 master with
+            # stochastic_rounding=False this is bitwise-identical to the foreach
+            # path below (``_store`` is a plain copy when dtypes match).
+            if self.moment_dtype is not None or self.stochastic_rounding:
+                sr = self.stochastic_rounding
                 bc2_sqrt = bias_correction2**0.5
                 step_size = lr / bias_correction1
                 for p_l, g_l, m, v in zip(params, grads, exp_avgs, exp_avg_sqs):
+                    pf = p_l.float()
                     mf = m.float()
                     vf = v.float()
                     gf = g_l.float()
                     if wd != 0.0:
-                        p_l.mul_(1.0 - lr * wd)
+                        pf.mul_(1.0 - lr * wd)
                     mf.lerp_(gf, 1.0 - beta1)
                     vf.mul_(beta2).addcmul_(gf, gf, value=1.0 - beta2)
                     denom = vf.sqrt().div_(bc2_sqrt).add_(eps)
-                    p_l.addcdiv_(mf, denom, value=-step_size)
-                    m.copy_(mf)
-                    v.copy_(vf)
+                    pf.addcdiv_(mf, denom, value=-step_size)
+                    self._store(p_l, pf, sr)
+                    self._store(m, mf, sr)
+                    self._store(v, vf, sr)
                 continue
 
             # Decoupled weight decay: p *= 1 - lr*wd.
