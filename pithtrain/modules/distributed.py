@@ -47,7 +47,7 @@ class DistributedCfg(SlottedDefault):
     EP dispatch and combine kernels with token deduplication.
     """
 
-    timeout: timedelta = timedelta(minutes=15)
+    timeout: timedelta = timedelta(minutes=40)
     """
     Timeout for distributed operations.
 
@@ -126,6 +126,14 @@ def setup_default_process_group(cfg: DistributedCfg, ctx: DistributedCtx) -> Non
     os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "0")
     os.environ.setdefault("TORCH_NCCL_DUMP_ON_TIMEOUT", "1")
     os.environ["TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC"] = str(int(cfg.timeout.total_seconds()))
+    # Sub-groups created by init_device_mesh (pp/dp/cp/ep) use NCCL's hardcoded
+    # 10-minute default rather than cfg.timeout, so a slow cold first-compile can
+    # exceed it and the watchdog aborts the run. Raise the NCCL default to match.
+    import torch.distributed.constants as _const
+    import torch.distributed.distributed_c10d as _c10d
+
+    _c10d.default_pg_nccl_timeout = cfg.timeout
+    _const.default_pg_nccl_timeout = cfg.timeout
 
     kwargs = dict()
     kwargs["backend"] = "nccl"
