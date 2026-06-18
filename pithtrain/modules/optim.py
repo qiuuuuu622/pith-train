@@ -45,6 +45,7 @@ class ForeachOffloadAdamW(torch.optim.Optimizer):
         weight_decay=0.0,
         moment_dtype=None,
         stochastic_rounding=False,
+        compute_device=None,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -65,8 +66,17 @@ class ForeachOffloadAdamW(torch.optim.Optimizer):
         # has decayed) is silently dropped and training stalls; stochastic
         # rounding preserves those updates in expectation. It frees a further
         # ~16GB (no fp32 master) for a larger micro-batch.
+        # compute_device routes the AdamW math onto a fast device while the state
+        # stays put. For CPU-offloaded experts (state in host RAM) the host AdamW
+        # is bandwidth-bound at ~37s/step (8 ranks share the host) and fully
+        # exposes the GPU. Setting compute_device="cuda" streams each tensor's
+        # state+grad to HBM, does the (sub-second) math there, and writes the
+        # result back to host -- turning a CPU-compute-bound step into a
+        # PCIe-transfer-bound one (~48GB x2, a few seconds, and overlap-able).
+        # None keeps the math on each tensor's own device (no transfer).
         self.moment_dtype = moment_dtype
         self.stochastic_rounding = stochastic_rounding
+        self.compute_device = None if compute_device is None else torch.device(compute_device)
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, _step=0)
         super().__init__(params, defaults)
 
@@ -128,21 +138,33 @@ class ForeachOffloadAdamW(torch.optim.Optimizer):
             # bf16 destinations when enabled. For an fp32 master with
             # stochastic_rounding=False this is bitwise-identical to the foreach
             # path below (``_store`` is a plain copy when dtypes match).
-            if self.moment_dtype is not None or self.stochastic_rounding:
+            if (
+                self.moment_dtype is not None
+                or self.stochastic_rounding
+                or self.compute_device is not None
+            ):
                 sr = self.stochastic_rounding
+                cd = self.compute_device
                 bc2_sqrt = bias_correction2**0.5
                 step_size = lr / bias_correction1
+
+                def _fp32(t):
+                    # Upcast (and move to the compute device, streaming offloaded
+                    # state to fast memory when cd is set). cd=None keeps it home.
+                    return t.to(cd, torch.float32) if cd is not None else t.float()
+
                 for p_l, g_l, m, v in zip(params, grads, exp_avgs, exp_avg_sqs):
-                    pf = p_l.float()
-                    mf = m.float()
-                    vf = v.float()
-                    gf = g_l.float()
+                    pf = _fp32(p_l)
+                    mf = _fp32(m)
+                    vf = _fp32(v)
+                    gf = _fp32(g_l)
                     if wd != 0.0:
                         pf.mul_(1.0 - lr * wd)
                     mf.lerp_(gf, 1.0 - beta1)
                     vf.mul_(beta2).addcmul_(gf, gf, value=1.0 - beta2)
                     denom = vf.sqrt().div_(bc2_sqrt).add_(eps)
                     pf.addcdiv_(mf, denom, value=-step_size)
+                    # _store copies back to the home tensor (D2H when cd is a GPU).
                     self._store(p_l, pf, sr)
                     self._store(m, mf, sr)
                     self._store(v, vf, sr)

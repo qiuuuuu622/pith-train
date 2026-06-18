@@ -51,6 +51,7 @@ training.min_lr = 1.0e-5
 # FUSE_CHUNKS=32 trims the fused-CE activation peak on the lm_head stage.
 training.expert_cpu_offload = bool(_i("OFFLOAD", 0))
 training.precision_aware_optimizer = bool(_i("PRECISION_AWARE_OPT", 1))
+training.optimizer_compute_on_gpu = bool(_i("OPT_COMPUTE_GPU", 0))
 training.offload_head = bool(_i("OFFLOAD_HEAD", 1))
 training.fuse_lmhead_ce = bool(_i("FUSE_CE", 1))
 training.fuse_lmhead_ce_chunks = _i("FUSE_CHUNKS", 32)

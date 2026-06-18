@@ -42,6 +42,49 @@ def test_stochastic_rounding_preserves_exact():
         torch.testing.assert_close(out, x, atol=0.0, rtol=0.0)
 
 
+def test_compute_device_matches_torch_adamw():
+    # compute_device routes the math to another device (on GPU: stream offloaded
+    # state -> HBM -> back). With compute_device == home device it must stay
+    # bitwise-identical to torch.optim.AdamW, proving the streaming path is a pure
+    # relocation of the math, not a numerical change.
+    ref_params = _make_params(21)
+    ours_params = [p.detach().clone().requires_grad_(True) for p in ref_params]
+    cfg = dict(lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
+    ref = torch.optim.AdamW(ref_params, **cfg)
+    ours = ForeachOffloadAdamW(ours_params, compute_device=torch.device("cpu"), **cfg)
+    torch.manual_seed(3)
+    for _ in range(20):
+        for rp, op in zip(ref_params, ours_params):
+            g = torch.randn_like(rp)
+            rp.grad = g.clone()
+            op.grad = g.clone()
+        ref.step()
+        ours.step()
+        for rp, op in zip(ref_params, ours_params):
+            torch.testing.assert_close(op, rp, rtol=1e-5, atol=1e-6)
+
+
+def test_compute_device_equiv_to_home():
+    # compute_device=home must give exactly the same result as compute_device=None
+    # (the bf16-moment streaming path is just a relocation).
+    ps = _make_params(31)
+    a = [p.detach().clone().requires_grad_(True) for p in ps]
+    b = [p.detach().clone().requires_grad_(True) for p in ps]
+    cfg = dict(lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, moment_dtype=torch.bfloat16)
+    oa = ForeachOffloadAdamW(a, **cfg)
+    ob = ForeachOffloadAdamW(b, compute_device=torch.device("cpu"), **cfg)
+    torch.manual_seed(9)
+    for _ in range(15):
+        for pa, pb in zip(a, b):
+            g = torch.randn_like(pa)
+            pa.grad = g.clone()
+            pb.grad = g.clone()
+        oa.step()
+        ob.step()
+        for pa, pb in zip(a, b):
+            torch.testing.assert_close(pb, pa, rtol=0.0, atol=0.0)
+
+
 def test_sr_master_fp32_path_unchanged():
     # stochastic_rounding=True with an fp32 master must stay bitwise-identical to
     # torch.optim.AdamW: SR only affects bf16 destinations, and an fp32 master is

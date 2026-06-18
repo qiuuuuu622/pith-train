@@ -190,6 +190,15 @@ class TrainingCfg(SlottedDefault):
     Pair with ``precision_aware_optimizer`` + ``expert_cpu_offload=False``.
     """
 
+    optimizer_compute_on_gpu: bool = False
+    """
+    For CPU-offloaded expert state, run the AdamW math on the GPU by streaming each
+    tensor's state+grad to HBM and writing the result back to host, instead of the
+    bandwidth-bound host step (~37s, GPU idle). Turns it into a PCIe-bound step
+    (~48GB x2, a few seconds). Only takes effect with ``expert_cpu_offload`` on; for
+    models that fit in HBM, ``precision_aware_optimizer`` + offload off is better.
+    """
+
     precision_aware_optimizer: bool = False
     """
     Store AdamW moments (exp_avg / exp_avg_sq) in bf16 instead of fp32 via
@@ -546,7 +555,17 @@ def setup_optimizer(cfg: TrainingCfg, ctx: TrainingCtx) -> None:
         from pithtrain.modules.optim import ForeachOffloadAdamW
 
         moment_dtype = torch.bfloat16 if cfg.precision_aware_optimizer else None
-        ctx.optimizer = ForeachOffloadAdamW(param_groups, moment_dtype=moment_dtype, **common)
+        # When state is offloaded to host, the host AdamW is bandwidth-bound at
+        # ~37s/step. optimizer_compute_on_gpu streams it to HBM for the (sub-second)
+        # math instead -- a PCIe-bound step. Only meaningful with offload on.
+        compute_device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if cfg.optimizer_compute_on_gpu and cfg.expert_cpu_offload
+            else None
+        )
+        ctx.optimizer = ForeachOffloadAdamW(
+            param_groups, moment_dtype=moment_dtype, compute_device=compute_device, **common
+        )
         return
     match cfg.optimizer:
         case "Adam":
